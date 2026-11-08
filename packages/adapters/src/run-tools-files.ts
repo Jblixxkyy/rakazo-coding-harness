@@ -1,9 +1,10 @@
 import { ATTACHMENT_MAX_BYTES } from "@rakazo/contracts";
 import { inferAttachmentMimeType, isBackgroundRunTrigger } from "@rakazo/core";
-import { resolveBotWorkspacePath } from "./computer-support.js";
+import { isolationRootForExecutionId, resolveBotWorkspacePath } from "./computer-support.js";
 import { desktopProtectionGuardMessage } from "./desktop-command-guard.js";
 import { protectedActivateScriptWriteRefusal } from "./desktop-guard-words.js";
 import { generateMediaFromTool } from "./media-generation-tools.js";
+import { invalidateRepoMapForWorkspace } from "./repo-map.js";
 import type { RunContext } from "./run-context.js";
 import { persistMessageInTransaction, publishMessage } from "./run-messages.js";
 import type { ToolCall, ToolHandlers } from "./run-tool-gate.js";
@@ -21,6 +22,9 @@ function runWorkspace(ctx: RunContext, call: ToolCall): RunWorkspace {
     markDirty: () => ctx.computer.checkpoint.markDirty(),
     context: ctx.context,
     runSecrets: ctx.secrets,
+    // An isolated subagent's calls carry its folder in the executionId; the
+    // workspace carries it so every file tool resolves under that folder.
+    isolationRoot: isolationRootForExecutionId(call.executionId),
   };
 }
 
@@ -128,7 +132,15 @@ export const fileTools: ToolHandlers = {
     try {
       await deps.sandbox.writeFile(
         await ctx.computer.get("tool", name),
-        { path: resolveBotWorkspacePath(ctx.computer.mode, bot.id, filePath), content },
+        {
+          path: resolveBotWorkspacePath(
+            ctx.computer.mode,
+            bot.id,
+            filePath,
+            isolationRootForExecutionId(call.executionId),
+          ),
+          content,
+        },
         context,
       );
     } catch (error) {
@@ -137,6 +149,7 @@ export const fileTools: ToolHandlers = {
       });
       throw error;
     }
+    invalidateRepoMapForWorkspace(runWorkspace(ctx, call));
     await recordComputerAction(ctx, call, "write_file", filePath, { bytes: content.byteLength });
     return call.finish({ ok: true, path: filePath });
   },
@@ -157,7 +170,12 @@ export const fileTools: ToolHandlers = {
       return call.finish({ error, path: filePath });
     };
     if (!deps.artifacts) return failAttach("artifact storage unavailable");
-    const storedPath = resolveBotWorkspacePath(ctx.computer.mode, bot.id, filePath);
+    const storedPath = resolveBotWorkspacePath(
+      ctx.computer.mode,
+      bot.id,
+      filePath,
+      isolationRootForExecutionId(call.executionId),
+    );
     let bytes: Uint8Array;
     try {
       bytes = await deps.sandbox.readFile(

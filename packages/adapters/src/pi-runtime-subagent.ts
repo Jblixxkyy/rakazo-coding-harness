@@ -3,6 +3,10 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { withAutomatedLabels } from "./automated-messages.js";
 import { DELEGATION_TOOL_NAMES } from "./builtin-tools.js";
 import { withCloudflareAuth } from "./cloudflare-ai-gateway.js";
+import {
+  ISOLATED_SUBAGENT_NAMESPACE_PREFIX,
+  isolatedSubagentWorkspace,
+} from "./computer-support.js";
 import { estimatePiImageTokens } from "./pi-image-context.js";
 import {
   assistantText,
@@ -29,24 +33,24 @@ import { deliverFinishedShells } from "./shell-command-stream.js";
 
 export const MAX_PARALLEL_SUBAGENTS = 4;
 
-/**
- * The workspace folder an isolated subagent writes under, so parallel
- * helpers never race on the same files. Reads stay workspace-wide; only
- * writes are confined. Enforcement is by instruction: the subagent shares
- * the parent run's tool dispatch, so a per-agent workspace root would need
- * executor-level routing that does not exist yet.
- */
-export function isolatedSubagentWorkspace(agentId: string): string {
-  const safe = agentId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 64) || "helper";
-  return `subagents/${safe}`;
-}
+// Re-exported so existing imports keep working; the folder lives in
+// computer-support.ts, next to the path resolution that enforces it.
+export { isolatedSubagentWorkspace } from "./computer-support.js";
 
+/**
+ * The system-prompt half of isolation. The real enforcement is tool-layer:
+ * an isolated subagent's namespace is `isolated:<agentId>`, so every file,
+ * shell, and git call it makes resolves under its folder and anything
+ * outside is refused. This text only tells the helper where its workspace is.
+ */
 export function isolatedSubagentInstruction(agentId: string): string {
   const dir = isolatedSubagentWorkspace(agentId);
   return (
-    `Work in isolation: read anywhere in the workspace, but write and edit ` +
-    `files only under ${dir}/, so parallel helpers never race on the same ` +
-    `files. Create that folder with your first write if it does not exist.`
+    `Work in isolation: your file, shell, and git tools are confined to ` +
+    `${dir}/ — reads and writes outside that folder are refused. Work only ` +
+    `with paths inside ${dir}/ (a bare filename lands there). Create that ` +
+    `folder with your first write if it does not exist, so parallel helpers ` +
+    `never race on the same files.`
   );
 }
 
@@ -142,7 +146,13 @@ export async function executeSubagent(
       ? (selectedModel.credentials?.accessToken ?? selectedModel.apiKey)
       : selectedModel.apiKey,
     depth: 1,
-    agentNamespace: agentId,
+    // The namespace is stamped into every tool call this helper makes (its
+    // executionId is ["pi-tool", namespace, callId]), so the tool layer can
+    // tell an isolated helper's calls from the parent's and confine them to
+    // its folder — no shared state, and parallel helpers get distinct
+    // folders because their run_subagent executionIds differ. The queue and
+    // session agentId stays the plain executionId.
+    agentNamespace: isolated ? `${ISOLATED_SUBAGENT_NAMESPACE_PREFIX}${agentId}` : agentId,
     pendingShells: [],
   };
   let contextPolicy = createRuntimeContextPolicy(

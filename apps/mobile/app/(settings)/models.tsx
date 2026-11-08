@@ -35,7 +35,7 @@ const noModels: MobileModel[] = [];
 const noCredentials: MobileModelCredential[] = [];
 
 /**
- * The main and approval model lists; connecting a provider opens its own screen. Opened with a
+ * The main, coding, and approval model lists; connecting a provider opens its own screen. Opened with a
  * Space, it edits that Space's override instead of the account's.
  */
 export default function Models() {
@@ -276,6 +276,12 @@ export default function Models() {
               {...shared}
               modelRole="approval"
               title={t("Approval model")}
+              defaultLabel={t("Choose a model")}
+            />
+            <ModelRoleSettings
+              {...shared}
+              modelRole="coding"
+              title={t("Coding model")}
               defaultLabel={t("Choose a model")}
             />
             {/* Connections are the account's in every Space, so a Space's override lists only its models. */}

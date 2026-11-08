@@ -16,6 +16,7 @@ import {
 } from "./browser-tools.js";
 import { BACKGROUND_WORK_LAUNCH } from "./computer-idle.js";
 import {
+  isolationRootForExecutionId,
   resolveBotUploadPath,
   resolveBotWorkspaceCwd,
   resolveBotWorkspacePath,
@@ -307,6 +308,8 @@ export const computerTools: ToolHandlers = {
       ctx.computer.mode,
       bot.id,
       args.cwd ? String(args.cwd) : undefined,
+      // An isolated helper's shell starts in its folder and cannot be pointed outside it.
+      isolationRootForExecutionId(call.executionId),
     );
     // Loaded per command so a command variable added, replaced, or removed mid-run
     // applies to the next command. Registered for redaction before anything runs.
@@ -463,7 +466,12 @@ export const computerTools: ToolHandlers = {
                 kind: "open",
                 path: /^https?:\/\//i.test(requestedPath)
                   ? requestedPath
-                  : resolveBotWorkspacePath(ctx.computer.mode, bot.id, requestedPath),
+                  : resolveBotWorkspacePath(
+                      ctx.computer.mode,
+                      bot.id,
+                      requestedPath,
+                      isolationRootForExecutionId(call.executionId),
+                    ),
               },
             ],
             observe: true,

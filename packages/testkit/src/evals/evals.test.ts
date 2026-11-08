@@ -176,9 +176,9 @@ describe("independent outcome graders", () => {
     e.files["results/language.txt"] = "French";
     expect(passes("updated-preference", e)).toBe(false);
   });
-  it("has 24 distinct cases, each rejects empty evidence and a completion claim", () => {
-    expect(EVAL_CASES).toHaveLength(24);
-    expect(new Set(EVAL_CASES.map((c) => c.id)).size).toBe(24);
+  it("has 29 distinct cases, each rejects empty evidence and a completion claim", () => {
+    expect(EVAL_CASES).toHaveLength(29);
+    expect(new Set(EVAL_CASES.map((c) => c.id)).size).toBe(29);
     for (const scenario of EVAL_CASES) {
       expect(
         passes(scenario.id, { ...evidence(), text: "Done! I completed everything." }),

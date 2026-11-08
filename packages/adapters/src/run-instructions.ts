@@ -33,7 +33,10 @@ export const FILE_TOOL_NAMES = [
   "glob",
   "edit",
   "apply_patch",
+  "undo_edit",
   "repo_map",
+  "find_definition",
+  "find_references",
 ] as const;
 
 export function builtinOffered(disabled: ReadonlySet<string> | undefined, name: string): boolean {

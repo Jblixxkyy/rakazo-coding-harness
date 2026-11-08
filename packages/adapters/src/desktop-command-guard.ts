@@ -28,6 +28,9 @@ import {
   isUnsafeSource,
   literalCommandToken,
   primaryCommandIndex,
+  readSafeCommandSubstitution,
+  replaceSafeCommandSubstitutions,
+  SAFE_COMMAND_SUBSTITUTION_PLACEHOLDER,
   SAFE_SHELL_CONTROL_OPS,
   SHELL_INTERPRETER_NAMES,
   STATIC_SHELL_EXPANSIONS,
@@ -202,7 +205,19 @@ function prepareDesktopGuardCommand(source: string): PreparedDesktopCommand {
   const appendExpansion = (): string | undefined => {
     const next = source[index + 1];
     if (next === "(") {
-      return source[index + 2] === "(" ? "arithmetic expansion" : "command substitution";
+      if (source[index + 2] === "(") return "arithmetic expansion";
+      // A bare `$(date)`-style substitution of a read-only command is safe to
+      // run; the placeholder stands in for it while the command is checked.
+      // The guard never rewrites the command that actually runs.
+      const safe = readSafeCommandSubstitution(source, index);
+      if (safe) {
+        out += SAFE_COMMAND_SUBSTITUTION_PLACEHOLDER;
+        rawWord += safe.raw;
+        index = safe.end;
+        atWordStart = false;
+        return undefined;
+      }
+      return "command substitution";
     }
     const expansion = readExpansion(source, index);
     if (!expansion) {
@@ -335,7 +350,9 @@ function prepareDesktopGuardCommand(source: string): PreparedDesktopCommand {
         } else {
           const hazard = heredocBodyHazard(body.content);
           if (hazard) return { reason: hazard };
-          out += body.content;
+          // Unquoted bodies expand, so an allowed `$(name)` reaches the
+          // tokenizer as its placeholder instead of an uninspectable expansion.
+          out += replaceSafeCommandSubstitutions(body.content);
         }
         cursor = body.end;
       }

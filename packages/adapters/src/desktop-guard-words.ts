@@ -25,6 +25,68 @@ export const SAFE_SHELL_CONTROL_OPS = new Set([
   "&>",
 ]);
 
+/**
+ * Rule change (round 2): a bare command substitution `$(name)` is allowed only
+ * for these read-only, no-argument commands, which cannot touch the desktop,
+ * the filesystem, or the network: `date`, `pwd`, `whoami`, `hostname`, `uname`,
+ * and `id`. Anything else inside `$(...)` — arguments (`$(date +%s)`), pipes,
+ * redirects, or another command (`$(printf x)`, `$(pkill chromium)`) — is still
+ * refused as "command substitution", because the guard cannot verify what it
+ * expands to. Backticks, arithmetic expansion, subshells, and interpreter
+ * heredocs stay refused for the same reason. The guard checks only; it never
+ * rewrites the command that runs, so an allowed substitution is replaced by
+ * this inert placeholder word while the command is tokenized.
+ */
+export const SAFE_COMMAND_SUBSTITUTIONS = new Set([
+  "date",
+  "pwd",
+  "whoami",
+  "hostname",
+  "uname",
+  "id",
+]);
+
+/** Inert word standing in for an allowed `$(...)` while a command is checked. */
+export const SAFE_COMMAND_SUBSTITUTION_PLACEHOLDER = "__rakazo_safe_substitution__";
+
+/**
+ * Read a bare `$(name)` at `source[start]`, allowing whitespace around the
+ * name. Returns the span and raw text when the name is in
+ * SAFE_COMMAND_SUBSTITUTIONS, otherwise undefined.
+ */
+export function readSafeCommandSubstitution(
+  source: string,
+  start: number,
+): { end: number; raw: string } | undefined {
+  if (source[start] !== "$" || source[start + 1] !== "(") return undefined;
+  let cursor = start + 2;
+  while (source[cursor] === " " || source[cursor] === "\t") cursor += 1;
+  const nameStart = cursor;
+  while (cursor < source.length && /[A-Za-z0-9_-]/.test(source[cursor] ?? "")) cursor += 1;
+  const name = source.slice(nameStart, cursor);
+  if (!SAFE_COMMAND_SUBSTITUTIONS.has(name)) return undefined;
+  while (source[cursor] === " " || source[cursor] === "\t") cursor += 1;
+  if (source[cursor] !== ")") return undefined;
+  return { end: cursor + 1, raw: source.slice(start, cursor + 1) };
+}
+
+/** Replace each bare allowed `$(name)` in `text` with the check placeholder. */
+export function replaceSafeCommandSubstitutions(text: string): string {
+  let out = "";
+  let index = 0;
+  while (index < text.length) {
+    const safe = text[index] === "$" ? readSafeCommandSubstitution(text, index) : undefined;
+    if (safe) {
+      out += SAFE_COMMAND_SUBSTITUTION_PLACEHOLDER;
+      index = safe.end;
+    } else {
+      out += text[index] ?? "";
+      index += 1;
+    }
+  }
+  return out;
+}
+
 /** Commands whose stdin heredoc is code, not data. Versioned names are matched separately. */
 const HEREDOC_INTERPRETERS = new Set([
   "ash",

@@ -212,6 +212,107 @@ describe("configured model selection", () => {
   });
 });
 
+describe("coding model selection", () => {
+  const coding: MemberMainModel = {
+    provider: "coding-provider",
+    modelId: "coding-model",
+    credential: credential("coding-provider", "coding-model"),
+  };
+  const base: SelectionInput = { ...defaults, coding };
+
+  it("uses the member's coding model over the main model when configured", () => {
+    expect(selectConfiguredModel(base)).toEqual({
+      provider: "coding-provider",
+      id: "coding-model",
+      credential: coding.credential,
+      thinkingLevel: null,
+    });
+  });
+
+  it("applies the coding model's own thinking level", () => {
+    expect(selectConfiguredModel({ ...base, coding: { ...coding, thinkingLevel: "low" } })).toEqual(
+      {
+        provider: "coding-provider",
+        id: "coding-model",
+        credential: coding.credential,
+        thinkingLevel: "low",
+      },
+    );
+  });
+
+  it("does not leak the main model's level onto a different coding model", () => {
+    expect(selectConfiguredModel({ ...base, main: { ...main, thinkingLevel: "xhigh" } })).toEqual({
+      provider: "coding-provider",
+      id: "coding-model",
+      credential: coding.credential,
+      thinkingLevel: null,
+    });
+  });
+
+  it("falls back to the main model when no coding model is set", () => {
+    expect(selectConfiguredModel({ ...defaults, coding: null })).toEqual({
+      provider: "space-provider",
+      id: "space-model",
+      credential: spaceCredential,
+      thinkingLevel: null,
+    });
+  });
+
+  it("falls back to the main model when the coding model's connection is gone", () => {
+    expect(selectConfiguredModel({ ...base, coding: { ...coding, credential: null } })).toEqual({
+      provider: "space-provider",
+      id: "space-model",
+      credential: spaceCredential,
+      thinkingLevel: null,
+    });
+  });
+
+  it("falls back to the deployment model when neither coding nor main can run", () => {
+    expect(
+      selectConfiguredModel({
+        ...base,
+        main: null,
+        coding: { ...coding, credential: null },
+      }),
+    ).toEqual({
+      provider: "settings-provider",
+      id: "settings-model",
+      credential: null,
+      thinkingLevel: null,
+    });
+  });
+
+  it("a bot override still wins over the coding model", () => {
+    expect(selectConfiguredModel({ ...base, override: bot, overrideCredential })).toEqual({
+      provider: "bot-provider",
+      id: "bot-model",
+      credential: overrideCredential,
+      thinkingLevel: "high",
+    });
+  });
+
+  it("inherits the coding model's level when the override names that model", () => {
+    expect(
+      selectConfiguredModel({
+        ...base,
+        override: {
+          modelProvider: "coding-provider",
+          modelId: "coding-model",
+          thinkingLevel: null,
+        },
+        overrideCredential: coding.credential,
+        coding: { ...coding, thinkingLevel: "xhigh" },
+        main: { ...main, thinkingLevel: "low" },
+      }),
+    ).toEqual({
+      provider: "coding-provider",
+      id: "coding-model",
+      credential: coding.credential,
+      thinkingLevel: "xhigh",
+    });
+  });
+});
+
 describe("model roles", () => {
   it("derives each purpose's deployment default in the shape of a member's choices", () => {
     expect(deploymentModelRole("main", deploymentDefaults)).toEqual({

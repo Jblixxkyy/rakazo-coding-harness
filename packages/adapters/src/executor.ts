@@ -510,7 +510,8 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         ]);
         // A member who set a coding model gets it for code-related runs; everyone
         // else keeps the main model. Bot overrides and pins still win in
-        // selectConfiguredModel below, and a missing coding model changes nothing.
+        // selectConfiguredModel below, and a coding model whose connection is gone
+        // falls back to the main model instead of the deployment's.
         const codingMain = isCodeRelated(task.prompt)
           ? await resolveMemberRoleModel(deps, run, "coding").catch((error: unknown) => {
               getLogger().warn("Coding model could not be loaded", { runId, error });
@@ -764,7 +765,8 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         const selected = selectConfiguredModel({
           override: modelChoice,
           overrideCredential,
-          main: codingMain ?? main,
+          main,
+          coding: codingMain,
           hostedProvider: (await modelCreditBillingEnabled(deps))
             ? resolveDeploymentModel().provider
             : undefined,
@@ -804,10 +806,21 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         const loadBackups = () =>
           (backupChoices ??= scripted
             ? Promise.resolve([])
-            : effectiveModelRole(deps.prisma, run, codingMain ? "coding" : "main", {
-                settings,
-                deployment: runDeployment,
-              }).then(
+            : effectiveModelRole(
+                deps.prisma,
+                run,
+                // Backups follow the model that actually won: the coding list only
+                // when the coding model runs, the main list otherwise.
+                codingMain !== null &&
+                  selected.provider === codingMain.provider &&
+                  selected.id === codingMain.modelId
+                  ? "coding"
+                  : "main",
+                {
+                  settings,
+                  deployment: runDeployment,
+                },
+              ).then(
                 (role) => role.backups,
                 (error: unknown) => {
                   getLogger().warn("Backup models could not be loaded", { runId, error });

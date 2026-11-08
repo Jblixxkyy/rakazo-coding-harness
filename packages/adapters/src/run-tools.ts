@@ -21,6 +21,8 @@ import { secretTools } from "./run-tools-secrets.js";
 import { taskTools } from "./run-tools-tasks.js";
 import { USER_COMPUTER_SHELL_TOOL, userComputerShell } from "./run-tools-user-computer.js";
 import { searchTools } from "./search-tools.js";
+import { symbolTools } from "./symbol-tools.js";
+import { todoTools } from "./todo-tools.js";
 import { argumentGiven } from "./update-bot-patch.js";
 
 const TOOL_HANDLERS = new Map<string, ToolHandler>([
@@ -30,6 +32,8 @@ const TOOL_HANDLERS = new Map<string, ToolHandler>([
   ...Object.entries(editTools),
   ...Object.entries(feedbackTools),
   ...Object.entries(repoMapTools),
+  ...Object.entries(symbolTools),
+  ...Object.entries(todoTools),
   ...Object.entries(memoryTools),
   ...Object.entries(integrationTools),
   ...Object.entries(taskTools),

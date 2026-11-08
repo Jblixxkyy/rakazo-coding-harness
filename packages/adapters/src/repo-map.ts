@@ -1,6 +1,6 @@
 import type { ComputerRef, SandboxProvider } from "@rakazo/adapter-kit";
 import { redactSecrets } from "@rakazo/core";
-import { resolveBotWorkspacePath } from "./computer-support.js";
+import { isolationRootForExecutionId, resolveBotWorkspacePath } from "./computer-support.js";
 import type { RunContext } from "./run-context.js";
 import type { ToolCall, ToolHandlers } from "./run-tool-gate.js";
 import type { RunWorkspace } from "./workspace-file-tools.js";
@@ -60,7 +60,36 @@ export function formatRepoMapForPrompt(map: RepoMap, maxChars = 6000): string {
   return text.length > maxChars ? `${text.slice(0, maxChars)}\n(map truncated)` : text;
 }
 
-const repoMapCache = new Map<string, { at: number; map: RepoMap }>();
+const repoMapCache = new Map<string, { at: number; map: RepoMap; version: number }>();
+/**
+ * Bumped whenever a workspace write lands, so a cached map built before the
+ * write is never served again. The map itself is never rebuilt on write —
+ * only the next read after a bump pays for a rebuild. Writers call this
+ * (see invalidateRepoMapForWorkspace); the cache check below does the rest.
+ */
+const repoMapVersions = new Map<string, number>();
+
+function repoMapCacheKey(workspace: RunWorkspace): string {
+  const base = `${workspace.botId}:${workspace.computerMode}`;
+  // Isolated helpers get their own cached map: same bot, different folder.
+  return workspace.isolationRoot ? `${base}:${workspace.isolationRoot}` : base;
+}
+
+function repoMapVersion(cacheKey: string): number {
+  return repoMapVersions.get(cacheKey) ?? 0;
+}
+
+/** Drop the cached map for one bot so the next read rebuilds it. Call after any workspace write. */
+export function invalidateRepoMap(botId: string, computerMode: string): void {
+  const cacheKey = `${botId}:${computerMode}`;
+  repoMapVersions.set(cacheKey, repoMapVersion(cacheKey) + 1);
+}
+
+/** Convenience wrapper for handlers that already hold a workspace. */
+export function invalidateRepoMapForWorkspace(workspace: RunWorkspace): void {
+  const cacheKey = repoMapCacheKey(workspace);
+  repoMapVersions.set(cacheKey, repoMapVersion(cacheKey) + 1);
+}
 
 interface GitignoreRule {
   dirOnly: boolean;
@@ -230,21 +259,30 @@ function scanSymbols(relPath: string, content: string, symbols: RepoMapSymbol[])
 
 /**
  * The workspace tree plus top-level symbols, cached for 60 seconds per bot.
- * `refresh` bypasses the cache. The tree is capped at 200 lines and symbols at
- * 300; either cap sets `truncated`.
+ * `refresh` bypasses the cache. A write that calls invalidateRepoMap bumps the
+ * version, so the next read rebuilds even inside the TTL; an unchanged
+ * workspace keeps serving the cached map. The tree is capped at 200 lines and
+ * symbols at 300; either cap sets `truncated`.
  */
 export async function buildRepoMap(
   sandbox: SandboxProvider,
   workspace: RunWorkspace,
   opts: { refresh?: boolean } = {},
 ): Promise<RepoMap> {
-  const cacheKey = `${workspace.botId}:${workspace.computerMode}`;
+  const cacheKey = repoMapCacheKey(workspace);
+  const version = repoMapVersion(cacheKey);
   if (!opts.refresh) {
     const cached = repoMapCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < REPO_MAP_CACHE_TTL_MS) return cached.map;
+    if (cached && cached.version === version && Date.now() - cached.at < REPO_MAP_CACHE_TTL_MS)
+      return cached.map;
   }
   const computer = await workspace.computer();
-  const root = resolveBotWorkspacePath(workspace.computerMode, workspace.botId, "");
+  const root = resolveBotWorkspacePath(
+    workspace.computerMode,
+    workspace.botId,
+    "",
+    workspace.isolationRoot,
+  );
   const rules = await loadGitignore(sandbox, computer, root, workspace);
   const lines: string[] = [];
   const symbols: RepoMapSymbol[] = [];
@@ -290,7 +328,11 @@ export async function buildRepoMap(
     files,
     truncated,
   };
-  repoMapCache.set(cacheKey, { at: Date.now(), map });
+  // A write that landed mid-build already bumped the version; do not let this
+  // stale build overwrite the cache — the next read rebuilds instead.
+  if (repoMapVersion(cacheKey) === version) {
+    repoMapCache.set(cacheKey, { at: Date.now(), map, version });
+  }
   return map;
 }
 
@@ -312,6 +354,7 @@ function runWorkspace(ctx: RunContext, call: ToolCall): RunWorkspace {
     markDirty: () => ctx.computer.checkpoint.markDirty(),
     context: ctx.context,
     runSecrets: ctx.secrets,
+    isolationRoot: isolationRootForExecutionId(call.executionId),
   };
 }
 

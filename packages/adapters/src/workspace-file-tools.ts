@@ -4,7 +4,12 @@ import { ATTACHMENT_MAX_BYTES } from "@rakazo/contracts";
 import { redactSecrets } from "@rakazo/core";
 import { getLogger } from "@rakazo/logging";
 import { JSDOM } from "jsdom";
-import { displayBotWorkspacePath, resolveBotWorkspacePath } from "./computer-support.js";
+import {
+  displayBotWorkspacePath,
+  resolveBotWorkspaceCwd,
+  resolveBotWorkspacePath,
+  workspaceRelativePath,
+} from "./computer-support.js";
 import type { ExecutorDeps } from "./executor-deps.js";
 import type { PlotSpec } from "./plot-tool.js";
 import {
@@ -25,25 +30,116 @@ export type RunWorkspace = {
   markDirty: () => void;
   context: AdapterContext;
   runSecrets: string[];
+  /**
+   * When set, this run is an isolated subagent confined to `subagents/<id>/`
+   * under the bot workspace: every path resolves under that folder. Null (or
+   * absent) is the parent run and non-isolated helpers, resolved as before.
+   */
+  isolationRoot?: string | null;
 };
 
 const MAX_MODEL_FILE_BYTES = 250_000;
-// The sandbox readFile primitive has no byte offset, so a paged slice of a
-// file larger than the model cap cannot be read through that cap. Paged reads
-// therefore read up to 1MB internally and return at most `limit` lines to the
-// model; non-paged reads keep the 250KB cap.
-const MAX_PAGED_FILE_BYTES = 1_000_000;
+// The sandbox readFile primitive has no byte offset, so it cannot return a
+// slice of a large file without loading the prefix. Paged reads therefore go
+// through the sandbox shell when it can run sed/awk (see
+// readPagedSliceViaShell): only the requested lines cross into memory. When
+// the shell cannot run them, a paged read falls back to readFile capped at
+// the same 250 KB model budget as an unpaged read — a larger file then
+// reports "file is too large" instead of loading a bigger slice. There is
+// deliberately no larger paged cap: no paged read ever materializes more
+// than 250 KB through readFile.
+/** Lines returned when a paged read gives an offset but no limit. */
+const PAGED_READ_DEFAULT_LIMIT = 500;
+/** Hard cap on lines per paged read, so one call stays bounded. */
+const PAGED_READ_MAX_LIMIT = 1000;
+
+/**
+ * Run one argv command in the workspace and collect its stdout. Returns
+ * null when the command cannot run at all (execute throws); the caller
+ * checks the exit code. Paths travel as separate argv entries, never
+ * through a shell string.
+ */
+async function runWorkspaceCommand(
+  sandbox: SandboxProvider,
+  workspace: RunWorkspace,
+  argv: string[],
+): Promise<{ stdout: string; stderr: string; code: number } | null> {
+  let stdout = "";
+  let stderr = "";
+  let code = 1;
+  try {
+    for await (const event of sandbox.execute(
+      await workspace.computer(),
+      {
+        argv,
+        cwd: resolveBotWorkspaceCwd(
+          workspace.computerMode,
+          workspace.botId,
+          undefined,
+          workspace.isolationRoot,
+        ),
+        timeoutMs: 30_000,
+      },
+      workspace.context,
+    )) {
+      if (event.type === "stdout") stdout += event.data;
+      else if (event.type === "stderr") stderr += event.data;
+      else code = event.code;
+    }
+  } catch {
+    return null;
+  }
+  return { stdout, stderr, code };
+}
+
+/**
+ * Read a line window plus the file's total line count without loading the
+ * file: `sed` prints only the requested lines and `awk` counts records
+ * (its NR matches the split-on-\n line count, trailing newline included).
+ * Returns null when the sandbox shell cannot run them, so the caller falls
+ * back to the readFile path. Both outputs are validated — a stub shell
+ * that echoes the command instead of running it fails the awk integer
+ * check and is never mistaken for a real result.
+ */
+async function readPagedSliceViaShell(
+  sandbox: SandboxProvider,
+  workspace: RunWorkspace,
+  relPath: string,
+  startLine: number,
+  lineLimit: number,
+): Promise<{ lines: string[]; totalLines: number } | null> {
+  const endLine = startLine + lineLimit - 1;
+  const window = await runWorkspaceCommand(sandbox, workspace, [
+    "sed",
+    "-n",
+    `${startLine},${endLine}p`,
+    relPath,
+  ]);
+  if (window?.code !== 0) return null;
+  const total = await runWorkspaceCommand(sandbox, workspace, ["awk", "END{print NR}", relPath]);
+  if (total?.code !== 0) return null;
+  const totalLines = Number(total.stdout.trim());
+  if (!Number.isInteger(totalLines) || totalLines < 0) return null;
+  // The shell output arrives as text from the provider; a non-UTF-8 file
+  // surfaces as a decode failure on the readFile fallback instead.
+  const text = window.stdout;
+  // A trailing newline terminates the last line rather than starting an empty one.
+  const lines = text === "" ? [] : text.split("\n");
+  if (text.endsWith("\n")) lines.pop();
+  if (lines.length > lineLimit) return null;
+  return { lines, totalLines };
+}
 
 export async function listFilesFromTool(
   sandbox: SandboxProvider,
   workspace: RunWorkspace,
   args: Record<string, unknown>,
 ) {
-  const { botId, computerMode, computer, context, runSecrets } = workspace;
+  const { botId, computerMode, computer, context, runSecrets, isolationRoot } = workspace;
   const requestedPath = String(args.path ?? "");
   const entries = await sandbox.listFiles(
     await computer(),
-    resolveBotWorkspacePath(computerMode, botId, requestedPath),
+    resolveBotWorkspacePath(computerMode, botId, requestedPath, isolationRoot),
     context,
   );
   return {
@@ -52,7 +148,7 @@ export async function listFilesFromTool(
       ...entry,
       // A file name can carry a value an earlier command or page wrote.
       path: redactSecrets(
-        displayBotWorkspacePath(computerMode, botId, requestedPath, entry.path),
+        displayBotWorkspacePath(computerMode, botId, requestedPath, entry.path, isolationRoot),
         runSecrets,
       ),
     })),
@@ -64,7 +160,7 @@ export async function readFileFromTool(
   workspace: RunWorkspace,
   args: Record<string, unknown>,
 ) {
-  const { botId, computerMode, computer, context, runSecrets } = workspace;
+  const { botId, computerMode, computer, context, runSecrets, isolationRoot } = workspace;
   const filePath = String(args.path ?? "");
   const offset = args.offset === undefined ? undefined : Number(args.offset);
   const limit = args.limit === undefined ? undefined : Number(args.limit);
@@ -76,8 +172,48 @@ export async function readFileFromTool(
     return { error: "limit must be a positive integer", path: filePath };
   }
   const paged = offset !== undefined || limit !== undefined || lineNumbers;
-  const maxBytes = paged ? MAX_PAGED_FILE_BYTES : MAX_MODEL_FILE_BYTES;
-  const storedPath = resolveBotWorkspacePath(computerMode, botId, filePath);
+  // One budget for every readFile call, paged or not: the 250 KB model cap.
+  // A paged read that cannot go through the shell (below) therefore never
+  // loads more than this; a larger file reports "file is too large".
+  const maxBytes = MAX_MODEL_FILE_BYTES;
+  const storedPath = resolveBotWorkspacePath(computerMode, botId, filePath, isolationRoot);
+  // A bounded window (offset and/or limit) is read through the shell when
+  // possible, so only the requested lines enter memory. A lineNumbers-only
+  // read has no window to bound, and a shell that cannot run sed/awk falls
+  // back to the readFile path below, capped at the 250 KB model budget.
+  if (offset !== undefined || limit !== undefined) {
+    const startLine = offset ?? 1;
+    const lineLimit = Math.min(limit ?? PAGED_READ_DEFAULT_LIMIT, PAGED_READ_MAX_LIMIT);
+    // The shell runs with the workspace (or isolation) root as its cwd, so
+    // the path it is given must be relative to that root — derived from the
+    // already-resolved stored path, never from the raw model-supplied path.
+    const relPath = workspaceRelativePath(computerMode, botId, storedPath, isolationRoot);
+    if (relPath) {
+      const sliced = await readPagedSliceViaShell(
+        sandbox,
+        workspace,
+        relPath,
+        startLine,
+        lineLimit,
+      );
+      if (sliced) {
+        const endLine = startLine + sliced.lines.length - 1;
+        return {
+          path: filePath,
+          content: redactSecrets(
+            sliced.lines
+              .map((line, index) => (lineNumbers ? `${startLine + index}: ${line}` : line))
+              .join("\n"),
+            runSecrets,
+          ),
+          totalLines: sliced.totalLines,
+          startLine,
+          endLine,
+          truncated: endLine < sliced.totalLines,
+        };
+      }
+    }
+  }
   let bytes: Uint8Array;
   try {
     bytes = await sandbox.readFile(await computer(), storedPath, context, {
@@ -149,7 +285,7 @@ export async function renderPlotFromTool(
   workspace: RunWorkspace,
   finish: (result: unknown) => Promise<unknown>,
 ) {
-  const { botId, computerMode, computer, context, runSecrets } = workspace;
+  const { botId, computerMode, computer, context, runSecrets, isolationRoot } = workspace;
   if (args.charts !== undefined) {
     const query = typeof args.charts === "string" ? args.charts : undefined;
     return {
@@ -170,7 +306,7 @@ export async function renderPlotFromTool(
     if (!rows && dataPath) {
       const bytes = await deps.sandbox.readFile(
         await computer(),
-        resolveBotWorkspacePath(computerMode, botId, dataPath),
+        resolveBotWorkspacePath(computerMode, botId, dataPath, isolationRoot),
         context,
         { maxBytes: deps.maxUploadSizeBytes ?? ATTACHMENT_MAX_BYTES },
       );
@@ -188,7 +324,7 @@ export async function renderPlotFromTool(
     await deps.sandbox.writeFile(
       await computer(),
       {
-        path: resolveBotWorkspacePath(computerMode, botId, outPath),
+        path: resolveBotWorkspacePath(computerMode, botId, outPath, isolationRoot),
         content: png,
       },
       context,

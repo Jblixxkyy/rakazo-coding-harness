@@ -1,6 +1,12 @@
-import type { ComputerRef } from "@rakazo/adapter-kit";
+import type {
+  AdapterContext,
+  CommandRequest,
+  ComputerRef,
+  ProcessEvent,
+} from "@rakazo/adapter-kit";
 import { describe, expect, it } from "vitest";
-import { FakeSandboxProvider } from "./fake-sandbox.js";
+import { normalizeWorkspacePath } from "./computer-support.js";
+import { type FakeBox, FakeSandboxProvider } from "./fake-sandbox.js";
 import {
   globFromTool,
   globToRegExp,
@@ -20,8 +26,10 @@ const context = {
   signal: new AbortController().signal,
 };
 
-async function seedBox(files: Record<string, string | Uint8Array>) {
-  const sandbox = new FakeSandboxProvider();
+async function seedBox(
+  files: Record<string, string | Uint8Array>,
+  sandbox: FakeSandboxProvider = new FakeSandboxProvider(),
+) {
   const computer: ComputerRef = await sandbox.provision(
     { botId: "search-test", homePath: "/ignored" },
     context,
@@ -39,6 +47,235 @@ async function seedBox(files: Record<string, string | Uint8Array>) {
     runSecrets: [],
   };
   return { sandbox, workspace };
+}
+
+type ShellToolset = "rg" | "grep" | "none";
+
+/**
+ * Test double for a sandbox with a real shell. Extends FakeSandboxProvider
+ * (same file map, same readFile/listFiles/writeFile) and emulates the probe,
+ * `rg`, `grep -rn` and `find` on that file map, recording every argv. It is
+ * not a shell: the probe answer is canned per toolset, and rg/grep/find only
+ * implement the exact argv shapes search-tools.ts emits, with the observable
+ * behaviour of the real tools (exit codes 0/1/2, `./`-prefixed paths, rg
+ * --max-filesize, grep -I skipping binary files, find -prune). That is
+ * enough to prove the fast path is used, its output is parsed and filtered,
+ * and any failure falls back to the walk.
+ */
+class ShellStubSandbox extends FakeSandboxProvider {
+  readonly commands: string[][] = [];
+  failSearch = false;
+  probeFails = false;
+  hasFind = true;
+
+  constructor(private readonly toolset: ShellToolset = "rg") {
+    super();
+  }
+
+  override async *execute(
+    computer: ComputerRef,
+    request: CommandRequest,
+    context: AdapterContext,
+  ): AsyncIterable<ProcessEvent> {
+    this.commands.push([...request.argv]);
+    const box = this.boxes.get(computer.id);
+    if (!box) {
+      yield { type: "stderr", data: "computer not found" };
+      yield { type: "exit", code: 1 };
+      return;
+    }
+    if (request.argv[0] === "sh" && request.argv[1] === "-c") {
+      if (this.probeFails) throw new Error("no shell here");
+      yield {
+        type: "stdout",
+        data: `${this.toolset}\n${this.hasFind ? "find" : "nofind"}\nPROBE_DONE\n`,
+      };
+      yield { type: "exit", code: 0 };
+      return;
+    }
+    if (
+      this.failSearch &&
+      (request.argv[0] === "rg" || request.argv[0] === "grep" || request.argv[0] === "find")
+    ) {
+      yield { type: "stderr", data: "simulated tool failure" };
+      yield { type: "exit", code: 2 };
+      return;
+    }
+    if (request.argv[0] === "rg") {
+      yield* this.runRg(box, request);
+      return;
+    }
+    if (request.argv[0] === "grep") {
+      yield* this.runGrep(box, request);
+      return;
+    }
+    if (request.argv[0] === "find") {
+      yield* this.runFind(box, request);
+      return;
+    }
+    yield* super.execute(computer, request, context);
+  }
+
+  probeCount(): number {
+    return this.commands.filter((argv) => argv[0] === "sh").length;
+  }
+
+  ran(tool: string): boolean {
+    return this.commands.some((argv) => argv[0] === tool);
+  }
+
+  private filesUnder(box: FakeBox, cwd: string | undefined) {
+    const prefix = cwd ? `${normalizeWorkspacePath(cwd)}/` : "";
+    const files: { rel: string; content: Uint8Array }[] = [];
+    for (const [stored, file] of [...box.files].sort(([a], [b]) => a.localeCompare(b))) {
+      if (stored.startsWith(prefix))
+        files.push({ rel: stored.slice(prefix.length), content: file.content });
+    }
+    return files;
+  }
+
+  private decodeText(content: Uint8Array): string | undefined {
+    try {
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(content);
+      return text.includes("\0") ? undefined : text;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async *runRg(box: FakeBox, request: CommandRequest): AsyncIterable<ProcessEvent> {
+    const args = request.argv.slice(1);
+    const globs: string[] = [];
+    let maxCount: number | undefined;
+    let maxFilesize: number | undefined;
+    let caseInsensitive = false;
+    let pattern: string | undefined;
+    let listFiles = false;
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index];
+      if (arg === "--files") listFiles = true;
+      else if (arg === "-i") caseInsensitive = true;
+      else if (arg === "--max-count") maxCount = Number(args[index + 1]);
+      else if (arg === "--max-filesize") maxFilesize = Number(args[index + 1]);
+      else if (arg === "--glob") globs.push(args[index + 1] ?? "");
+      else if (arg === "-e") pattern = args[index + 1];
+    }
+    const files = this.filesUnder(box, request.cwd);
+    const excluded = (rel: string) =>
+      globs.some((glob) => glob.startsWith("!") && matchesGlob(glob.slice(1), rel));
+    const included = (rel: string) =>
+      globs.every((glob) => glob.startsWith("!") || matchesGlob(glob, rel));
+    if (listFiles) {
+      for (const file of files) {
+        if (!excluded(file.rel)) yield { type: "stdout", data: `./${file.rel}\n` };
+      }
+      yield { type: "exit", code: 0 };
+      return;
+    }
+    let regex: RegExp;
+    try {
+      regex = new RegExp(pattern ?? "", caseInsensitive ? "i" : "");
+    } catch {
+      yield { type: "stderr", data: "regex parse error" };
+      yield { type: "exit", code: 2 };
+      return;
+    }
+    let matched = false;
+    for (const file of files) {
+      if (maxFilesize !== undefined && file.content.byteLength > maxFilesize) continue;
+      if (excluded(file.rel) || !included(file.rel)) continue;
+      const text = this.decodeText(file.content);
+      if (text === undefined) continue;
+      let perFile = 0;
+      const lines = text.split("\n");
+      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+        const line = lines[lineIndex];
+        if (line === undefined || !regex.test(line)) continue;
+        if (maxCount !== undefined && perFile >= maxCount) break;
+        perFile += 1;
+        matched = true;
+        yield { type: "stdout", data: `./${file.rel}:${lineIndex + 1}:${line}\n` };
+      }
+    }
+    yield { type: "exit", code: matched ? 0 : 1 };
+  }
+
+  private async *runGrep(box: FakeBox, request: CommandRequest): AsyncIterable<ProcessEvent> {
+    const args = request.argv.slice(1);
+    const excludeDirs: string[] = [];
+    const excludes: string[] = [];
+    let include: string | undefined;
+    let maxCount: number | undefined;
+    let caseInsensitive = false;
+    let pattern: string | undefined;
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index] ?? "";
+      if (arg === "-i") caseInsensitive = true;
+      else if (arg === "-m") maxCount = Number(args[index + 1]);
+      else if (arg.startsWith("--exclude-dir="))
+        excludeDirs.push(arg.slice("--exclude-dir=".length));
+      else if (arg.startsWith("--exclude=")) excludes.push(arg.slice("--exclude=".length));
+      else if (arg.startsWith("--include=")) include = arg.slice("--include=".length);
+      else if (arg === "-e") pattern = args[index + 1];
+    }
+    let regex: RegExp;
+    try {
+      regex = new RegExp(pattern ?? "", caseInsensitive ? "i" : "");
+    } catch {
+      yield { type: "stderr", data: "regex parse error" };
+      yield { type: "exit", code: 2 };
+      return;
+    }
+    let matched = false;
+    for (const file of this.filesUnder(box, request.cwd)) {
+      const segments = file.rel.split("/");
+      if (segments.some((segment) => excludeDirs.some((dir) => matchesGlob(dir, segment))))
+        continue;
+      const base = segments[segments.length - 1] ?? "";
+      if (excludes.some((exclude) => matchesGlob(exclude, base))) continue;
+      if (include && !matchesGlob(include, file.rel)) continue;
+      const text = this.decodeText(file.content);
+      if (text === undefined) continue;
+      let perFile = 0;
+      const lines = text.split("\n");
+      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+        const line = lines[lineIndex];
+        if (line === undefined || !regex.test(line)) continue;
+        if (maxCount !== undefined && perFile >= maxCount) break;
+        perFile += 1;
+        matched = true;
+        yield { type: "stdout", data: `./${file.rel}:${lineIndex + 1}:${line}\n` };
+      }
+    }
+    yield { type: "exit", code: matched ? 0 : 1 };
+  }
+
+  private async *runFind(box: FakeBox, request: CommandRequest): AsyncIterable<ProcessEvent> {
+    const pruned = new Set<string>();
+    const args = request.argv.slice(1);
+    for (let index = 0; index < args.length; index += 1) {
+      if (args[index] === "-name" && args[index + 2] === "-prune")
+        pruned.add(args[index + 1] ?? "");
+    }
+    for (const file of this.filesUnder(box, request.cwd)) {
+      const segments = file.rel.split("/").slice(0, -1);
+      if (segments.some((segment) => pruned.has(segment))) continue;
+      yield { type: "stdout", data: `./${file.rel}\n` };
+    }
+    yield { type: "exit", code: 0 };
+  }
+}
+
+async function seedShellBox(
+  files: Record<string, string | Uint8Array>,
+  toolset: ShellToolset = "rg",
+  options: { probeFails?: boolean; hasFind?: boolean; failSearch?: boolean } = {},
+) {
+  const sandbox = new ShellStubSandbox(toolset);
+  sandbox.probeFails = options.probeFails ?? false;
+  sandbox.hasFind = options.hasFind ?? true;
+  sandbox.failSearch = options.failSearch ?? false;
+  return { ...(await seedBox(files, sandbox)), sandbox };
 }
 
 describe("matchesGlob", () => {
@@ -342,5 +579,198 @@ describe("walkWorkspaceFiles", () => {
       "node_modules/dep/index.js",
       "node_modules/dep/nested/other.js",
     ]);
+  });
+});
+
+describe("grep fast path (rg)", () => {
+  const tree = {
+    // Anchored /debug.log ignores the root file only; sub/debug.log must
+    // still match on both paths (the fast path must not over-prune it).
+    ".gitignore": "/debug.log\nignored-dir/\n",
+    "debug.log": "needle\n",
+    "ignored-dir/notes.txt": "needle\n",
+    "keep.txt": "needle\n",
+    "node_modules/dep/index.js": "needle\n",
+    "src/a.ts": "hello world\nsecond line\nhello again\n",
+    "src/b.ts": "nothing here\n",
+    "sub/debug.log": "needle\n",
+  };
+
+  it("finds matches through rg, honouring ignores, with the walk's shape", async () => {
+    const { sandbox, workspace } = await seedShellBox(tree, "rg");
+    expect(await grepFromTool(sandbox, workspace, { pattern: "needle" })).toEqual({
+      matches: [
+        { path: "keep.txt", line: 1, text: "needle" },
+        { path: "sub/debug.log", line: 1, text: "needle" },
+      ],
+      truncated: false,
+    });
+    expect(sandbox.ran("rg")).toBe(true);
+    expect(sandbox.probeCount()).toBe(1);
+  });
+
+  it("matches the walk result exactly on the same tree", async () => {
+    const fast = await seedShellBox(tree, "rg");
+    const walked = await seedBox(tree);
+    for (const args of [
+      { pattern: "hello" },
+      { pattern: "HELLO", caseSensitive: false },
+      { pattern: "needle", include: "*.txt" },
+      { pattern: "needle", path: "src" },
+      { pattern: "needle", limit: 1 },
+    ]) {
+      expect(await grepFromTool(fast.sandbox, fast.workspace, args)).toEqual(
+        await grepFromTool(walked.sandbox, walked.workspace, args),
+      );
+    }
+  });
+
+  it("probes once per computer across grep and glob calls", async () => {
+    const { sandbox, workspace } = await seedShellBox(tree, "rg");
+    await grepFromTool(sandbox, workspace, { pattern: "needle" });
+    await grepFromTool(sandbox, workspace, { pattern: "hello" });
+    await globFromTool(sandbox, workspace, { pattern: "*.ts" });
+    expect(sandbox.probeCount()).toBe(1);
+  });
+
+  it("skips oversize files on the rg path", async () => {
+    const { sandbox, workspace } = await seedShellBox({
+      "big.txt": new TextEncoder().encode(`needle\n${"x".repeat(300_000)}`),
+      "small.txt": "needle\n",
+    });
+    expect(await grepFromTool(sandbox, workspace, { pattern: "needle" })).toEqual({
+      matches: [{ path: "small.txt", line: 1, text: "needle" }],
+      truncated: false,
+    });
+  });
+
+  it("falls back to the walk when rg fails", async () => {
+    const { sandbox, workspace } = await seedShellBox(tree, "rg", { failSearch: true });
+    expect(await grepFromTool(sandbox, workspace, { pattern: "needle" })).toEqual({
+      matches: [
+        { path: "keep.txt", line: 1, text: "needle" },
+        { path: "sub/debug.log", line: 1, text: "needle" },
+      ],
+      truncated: false,
+    });
+  });
+
+  it("falls back to the walk when the probe fails", async () => {
+    const { sandbox, workspace } = await seedShellBox(tree, "rg", { probeFails: true });
+    expect(await grepFromTool(sandbox, workspace, { pattern: "needle" })).toEqual({
+      matches: [
+        { path: "keep.txt", line: 1, text: "needle" },
+        { path: "sub/debug.log", line: 1, text: "needle" },
+      ],
+      truncated: false,
+    });
+    expect(sandbox.ran("rg")).toBe(false);
+  });
+});
+
+describe("grep fast path (grep)", () => {
+  it("finds matches through grep, honouring ignores", async () => {
+    const { sandbox, workspace } = await seedShellBox(
+      {
+        ".gitignore": "*.log\n",
+        "debug.log": "needle\n",
+        "keep.txt": "needle\n",
+        "node_modules/dep/index.js": "needle\n",
+        "src/a.ts": "Needle\nneedle\n",
+      },
+      "grep",
+    );
+    expect(await grepFromTool(sandbox, workspace, { pattern: "needle" })).toEqual({
+      matches: [
+        { path: "keep.txt", line: 1, text: "needle" },
+        { path: "src/a.ts", line: 2, text: "needle" },
+      ],
+      truncated: false,
+    });
+    expect(sandbox.ran("grep")).toBe(true);
+    expect(sandbox.ran("rg")).toBe(false);
+  });
+
+  it("matches the walk result exactly on the same tree", async () => {
+    const tree = {
+      "a.txt": "hello\nHELLO\n",
+      "src/b.ts": "hello again\n",
+      "src/c.js": "hello\n",
+    };
+    const fast = await seedShellBox(tree, "grep");
+    const walked = await seedBox(tree);
+    for (const args of [
+      { pattern: "hello" },
+      { pattern: "hello", caseSensitive: false },
+      { pattern: "hello", include: "*.ts" },
+      { pattern: "hello", limit: 2 },
+    ]) {
+      expect(await grepFromTool(fast.sandbox, fast.workspace, args)).toEqual(
+        await grepFromTool(walked.sandbox, walked.workspace, args),
+      );
+    }
+  });
+
+  it("falls back to the walk when grep fails", async () => {
+    const { sandbox, workspace } = await seedShellBox({ "a.txt": "needle\n" }, "grep", {
+      failSearch: true,
+    });
+    expect(await grepFromTool(sandbox, workspace, { pattern: "needle" })).toEqual({
+      matches: [{ path: "a.txt", line: 1, text: "needle" }],
+      truncated: false,
+    });
+  });
+});
+
+describe("glob fast path", () => {
+  const tree = {
+    ".gitignore": "*.log\n",
+    "debug.log": "",
+    "src/a.ts": "",
+    "src/deep/b.ts": "",
+    "src/c.js": "",
+    "top.ts": "",
+    "node_modules/dep/index.js": "",
+  };
+
+  it("lists files through rg --files", async () => {
+    const { sandbox, workspace } = await seedShellBox(tree, "rg");
+    expect(await globFromTool(sandbox, workspace, { pattern: "**/*" })).toEqual({
+      paths: [".gitignore", "src/a.ts", "src/c.js", "src/deep/b.ts", "top.ts"],
+      truncated: false,
+    });
+    expect(await globFromTool(sandbox, workspace, { pattern: "*.ts" })).toEqual({
+      paths: ["src/a.ts", "src/deep/b.ts", "top.ts"],
+      truncated: false,
+    });
+    expect(sandbox.ran("rg")).toBe(true);
+  });
+
+  it("lists files through find when only grep is available", async () => {
+    const { sandbox, workspace } = await seedShellBox(tree, "grep");
+    expect(await globFromTool(sandbox, workspace, { pattern: "*.ts" })).toEqual({
+      paths: ["src/a.ts", "src/deep/b.ts", "top.ts"],
+      truncated: false,
+    });
+    expect(sandbox.ran("find")).toBe(true);
+    expect(sandbox.ran("rg")).toBe(false);
+  });
+
+  it("falls back to the walk for glob when find is unavailable", async () => {
+    const { sandbox, workspace } = await seedShellBox(tree, "grep", { hasFind: false });
+    expect(await globFromTool(sandbox, workspace, { pattern: "*.ts" })).toEqual({
+      paths: ["src/a.ts", "src/deep/b.ts", "top.ts"],
+      truncated: false,
+    });
+    expect(sandbox.ran("find")).toBe(false);
+    expect(sandbox.ran("rg")).toBe(false);
+  });
+
+  it("falls back to the walk when the listing fails", async () => {
+    const { sandbox, workspace } = await seedShellBox(tree, "rg", { failSearch: true });
+    expect(await globFromTool(sandbox, workspace, { pattern: "*.ts" })).toEqual({
+      paths: ["src/a.ts", "src/deep/b.ts", "top.ts"],
+      truncated: false,
+    });
   });
 });

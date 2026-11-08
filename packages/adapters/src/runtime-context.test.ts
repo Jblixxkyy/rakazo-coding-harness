@@ -392,6 +392,56 @@ describe("runtime context policy", () => {
     for (const id of ["file", "map", "diff"]) expect(body(id)).toBe(codingBody);
     expect(body("shell-1")).toContain("[Earlier result shortened after you read it");
   });
+  it("compacts old coding-tool results in a long session while keeping the most recent verbatim", () => {
+    const { request, context } = fixture(0);
+    const call = (id: string, name: string) =>
+      ({
+        role: "assistant",
+        content: [{ type: "toolCall", id, name, arguments: {} }],
+        timestamp: 101,
+      }) as unknown as Message;
+    const result = (id: string, name: string, body: string) =>
+      ({
+        role: "toolResult",
+        toolCallId: id,
+        toolName: name,
+        content: [{ type: "text", text: body }],
+        isError: false,
+        timestamp: 102,
+      }) as Message;
+    const codingBody = (index: number) =>
+      JSON.stringify({
+        path: `src/f${index}.ts`,
+        content: "exact coding evidence ".repeat(300),
+        totalLines: 120,
+      });
+    const readIds = Array.from({ length: 10 }, (_, index) => `read-${index}`);
+    context.messages.push(
+      ...readIds.flatMap((id, index) => [
+        call(id, "read_file"),
+        result(id, "read_file", codingBody(index)),
+      ]),
+      call("later", "shell"),
+      result("later", "shell", "ok"),
+    );
+    const prepared = createRuntimeContextPolicy({
+      ...request,
+      contextStrategy: DEFAULT_CONTEXT_STRATEGY,
+    }).prepareContext(context, { ...model, contextWindow: 200_000 });
+    const body = (id: string) => {
+      const message = prepared.messages.find(
+        (message) => message.role === "toolResult" && message.toolCallId === id,
+      ) as Extract<Message, { role: "toolResult" }>;
+      return message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+    };
+    expect(body("read-0")).toBe("[compacted read_file: src/f0.ts; 120 lines]");
+    expect(body("read-1")).toBe("[compacted read_file: src/f1.ts; 120 lines]");
+    expect(body("read-0")).not.toContain("exact coding evidence");
+    for (let index = 2; index < 10; index++) {
+      expect(body(`read-${index}`)).toBe(codingBody(index));
+    }
+    expect(body("later")).toBe("ok");
+  });
   it.each([65_536, 10_000])(
     "retains individual parallel results within a %i budget",
     (contextWindow) => {

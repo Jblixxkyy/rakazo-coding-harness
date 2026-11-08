@@ -132,11 +132,18 @@ export function describeToolActivity(toolName: string, args: unknown): string {
   if (toolName === "glob") return `Finding files matching ${detail(record.pattern)}`;
   if (toolName === "edit") return `Editing ${detail(record.path)}`;
   if (toolName === "apply_patch") return "Applying a patch";
+  if (toolName === "undo_edit") return "Undoing the last edit";
+  if (toolName === "find_definition") return `Finding the definition of ${detail(record.name)}`;
+  if (toolName === "find_references") return `Finding uses of ${detail(record.name)}`;
+  if (toolName === "todo_write") return "Updating the plan";
+  if (toolName === "todo_read") return "Reading the plan";
+  if (toolName === "todo_update") return "Updating a plan step";
   if (toolName === "git_status") return "Checking git status";
   if (toolName === "git_diff") return "Showing git changes";
   if (toolName === "git_commit") return `Committing: ${detail(record.message)}`;
   if (toolName === "run_tests") return "Running tests";
   if (toolName === "diagnostics") return "Checking for errors";
+  if (toolName === "run_build") return "Building the project";
   if (toolName === "repo_map") return "Mapping the workspace";
   if (toolName === "attach_file") return `Attaching ${detail(record.path)}`;
   if (toolName === "open_path") return `Opening ${detail(record.path)}`;
@@ -326,6 +333,9 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
           instructions: raw.instructions ? String(raw.instructions) : "",
           model_provider: raw.model_provider ? String(raw.model_provider) : "",
           model_id: raw.model_id ? String(raw.model_id) : "",
+          // Keep `isolated`: without it the flag never reaches the handler
+          // and an isolated helper would run unconfined.
+          ...(raw.isolated === true ? { isolated: true } : {}),
         };
       }
       if (tool.name === "spawn_bot") {

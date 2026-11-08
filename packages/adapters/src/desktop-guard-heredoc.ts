@@ -7,6 +7,7 @@ import {
   lexicalPath,
   literalCommandToken,
   primaryCommandIndex,
+  readSafeCommandSubstitution,
 } from "./desktop-guard-words.js";
 
 export function readHeredocDelimiter(
@@ -75,7 +76,7 @@ export function readHeredocBody(
   return undefined;
 }
 
-/** Unquoted heredoc bodies expand even inside quote characters. */
+/** Unquoted heredoc bodies expand even inside quote characters. A bare allowed `$(name)` (see SAFE_COMMAND_SUBSTITUTIONS) expands to a read-only value and is skipped. */
 export function heredocBodyHazard(body: string): string | undefined {
   for (let index = 0; index < body.length; index += 1) {
     const character = body[index];
@@ -88,6 +89,11 @@ export function heredocBodyHazard(body: string): string | undefined {
     }
     if (character === "`") return "backtick";
     if (character === "$" && body[index + 1] === "(") {
+      const safe = readSafeCommandSubstitution(body, index);
+      if (safe) {
+        index = safe.end - 1;
+        continue;
+      }
       return body[index + 2] === "(" ? "arithmetic expansion" : "command substitution";
     }
   }

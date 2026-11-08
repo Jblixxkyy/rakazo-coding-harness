@@ -12,6 +12,11 @@ const NEW_IDS = [
   "large-repo-navigation",
   "context-retention-after-many-tools",
   "parallel-exploration",
+  "find-definition",
+  "find-references",
+  "todo-tracked-refactor",
+  "run-build-failure-report",
+  "undo-after-bad-patch",
 ] as const;
 
 function evidence(): Evidence {
@@ -38,7 +43,7 @@ const criterion = (id: string, e: Evidence, criterionId: string) =>
   grades(id, e).find((c) => c.id === criterionId)!.pass;
 
 describe("coding eval cases", () => {
-  it("adds exactly the 8 coding cases, each without a judge", () => {
+  it("adds exactly the 13 coding cases, each without a judge", () => {
     for (const id of NEW_IDS) {
       const found = EVAL_CASES.find((c) => c.id === id);
       expect(found, id).toBeDefined();
@@ -212,5 +217,104 @@ describe("coding eval cases", () => {
     e.toolNames = ["write_file", "read_file"];
     expect(criterion("parallel-exploration", e, "used-run-subagent")).toBe(false);
     expect(passes("parallel-exploration", e)).toBe(false);
+  });
+
+  it("find-definition requires the exact location and the find_definition tool", () => {
+    const e = evidence();
+    e.files["results/definition.txt"] = "src/math.ts:1";
+    e.toolNames = ["write_file", "find_definition"];
+    expect(passes("find-definition", e)).toBe(true);
+    e.toolNames = ["write_file", "grep"];
+    expect(criterion("find-definition", e, "used-find-definition")).toBe(false);
+    expect(passes("find-definition", e)).toBe(false);
+    e.toolNames = ["write_file", "find_definition"];
+    e.files["results/definition.txt"] = "src/main.ts:2";
+    expect(criterion("find-definition", e, "exact-definition-location")).toBe(false);
+    e.files["results/definition.txt"] = "src/math.ts:2";
+    expect(passes("find-definition", e)).toBe(false);
+  });
+
+  it("find-references requires the referencing files and the find_references tool", () => {
+    const e = evidence();
+    e.files["results/references.txt"] = "src/cart.ts\nsrc/checkout.ts";
+    e.toolNames = ["write_file", "find_references"];
+    expect(passes("find-references", e)).toBe(true);
+    e.files["results/references.txt"] = "src/cart.ts\nsrc/checkout.ts\n";
+    expect(passes("find-references", e)).toBe(true);
+    e.files["results/references.txt"] = "src/pricing.ts\nsrc/cart.ts\nsrc/checkout.ts";
+    expect(criterion("find-references", e, "referencing-files")).toBe(false);
+    e.files["results/references.txt"] = "src/cart.ts";
+    expect(passes("find-references", e)).toBe(false);
+    e.files["results/references.txt"] = "src/cart.ts\nsrc/checkout.ts";
+    e.toolNames = ["write_file", "grep"];
+    expect(criterion("find-references", e, "used-find-references")).toBe(false);
+    expect(passes("find-references", e)).toBe(false);
+  });
+
+  it("todo-tracked-refactor requires the rename and all three todo tools", () => {
+    const renamed = {
+      "src/invoice.ts": "export interface Invoice {\n  id: string;\n  amount: number;\n}",
+      "src/billing.ts":
+        "export function billTotal(invoice: Invoice): number {\n  return invoice.amount;\n}",
+      "src/report.ts":
+        'export function reportTotal(invoice: Invoice): string {\n  return "Total: " + invoice.amount;\n}',
+    };
+    const e = { ...evidence(), files: { ...renamed } };
+    e.toolNames = ["write_file", "todo_write", "todo_update", "todo_read"];
+    expect(passes("todo-tracked-refactor", e)).toBe(true);
+    e.toolNames = ["write_file", "todo_write", "todo_update"];
+    expect(criterion("todo-tracked-refactor", e, "used-todo-read")).toBe(false);
+    expect(passes("todo-tracked-refactor", e)).toBe(false);
+    e.toolNames = ["write_file", "todo_write", "todo_read"];
+    expect(criterion("todo-tracked-refactor", e, "used-todo-update")).toBe(false);
+    e.toolNames = ["write_file", "todo_update", "todo_read"];
+    expect(criterion("todo-tracked-refactor", e, "used-todo-write")).toBe(false);
+    e.toolNames = ["write_file", "todo_write", "todo_update", "todo_read"];
+    e.files["src/billing.ts"] = "return invoice.total;";
+    expect(criterion("todo-tracked-refactor", e, "billing-call-site-updated")).toBe(false);
+    e.files["src/billing.ts"] = renamed["src/billing.ts"];
+    e.files["src/invoice.ts"] = "export interface Invoice {\n  id: string;\n  total: number;\n}";
+    expect(criterion("todo-tracked-refactor", e, "interface-renamed")).toBe(false);
+    expect(passes("todo-tracked-refactor", e)).toBe(false);
+  });
+
+  it("run-build-failure-report requires the honest failure and the run_build tool", () => {
+    const e = evidence();
+    e.files["results/build-report.txt"] =
+      "The build could not run: no build configured for this repo.";
+    e.toolNames = ["write_file", "run_build"];
+    expect(passes("run-build-failure-report", e)).toBe(true);
+    e.files["results/build-report.txt"] = "The build could not run: NO BUILD CONFIGURED.";
+    expect(passes("run-build-failure-report", e)).toBe(true);
+    e.files["results/build-report.txt"] = "The build succeeded.";
+    expect(criterion("run-build-failure-report", e, "failure-reported")).toBe(false);
+    expect(criterion("run-build-failure-report", e, "no-false-success")).toBe(false);
+    e.files["results/build-report.txt"] =
+      "The build could not run: no build configured for this repo.";
+    e.toolNames = ["write_file", "shell"];
+    expect(criterion("run-build-failure-report", e, "used-run-build")).toBe(false);
+    expect(passes("run-build-failure-report", e)).toBe(false);
+  });
+
+  it("undo-after-bad-patch requires the original contents and apply_patch plus undo_edit", () => {
+    const original = {
+      "src/types.ts": "export interface Widget {\n  id: string;\n  label: string;\n}",
+      "src/render.ts":
+        'export function renderWidget(widget: Widget): string {\n  return "[" + widget.id + "] " + widget.label;\n}',
+      "src/list.ts":
+        "export function listWidgets(widgets: Widget[]): string[] {\n  return widgets.map((widget) => widget.label);\n}",
+    };
+    const e = { ...evidence(), files: { ...original } };
+    e.toolNames = ["write_file", "apply_patch", "undo_edit"];
+    expect(passes("undo-after-bad-patch", e)).toBe(true);
+    e.toolNames = ["write_file", "apply_patch"];
+    expect(criterion("undo-after-bad-patch", e, "used-undo-edit")).toBe(false);
+    expect(passes("undo-after-bad-patch", e)).toBe(false);
+    e.toolNames = ["write_file", "undo_edit"];
+    expect(criterion("undo-after-bad-patch", e, "used-apply-patch")).toBe(false);
+    e.toolNames = ["write_file", "apply_patch", "undo_edit"];
+    e.files["src/types.ts"] = "export interface Widget {\n  id: string;\n  title: string;\n}";
+    expect(criterion("undo-after-bad-patch", e, "original-restored")).toBe(false);
+    expect(passes("undo-after-bad-patch", e)).toBe(false);
   });
 });

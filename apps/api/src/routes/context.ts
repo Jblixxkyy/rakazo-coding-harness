@@ -197,8 +197,10 @@ export function createRouterContext(deps: RouterDeps) {
     role: ModelRole,
     settings: ModelRoleSettings,
   ): Promise<ModelRoleView> => {
+    // The coding role falls back to the deployment's main model, so its view names
+    // that model the way the main role's does; only approval has its own default.
     const defaults =
-      role === "main"
+      role === "main" || role === "coding"
         ? {
             settings: await deps.prisma.deploymentSettings.findUnique({ where: { id: "default" } }),
             // Only a model the deployment can run stands in for the member's choice.

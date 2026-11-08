@@ -3,6 +3,11 @@ import type { Api, Context, Message, Model } from "@earendil-works/pi-ai";
 import type { AdapterContext, AgentRunRequest, AgentUsage } from "@rakazo/adapter-kit";
 import { DEFAULT_CONTEXT_STRATEGY } from "@rakazo/adapter-kit";
 import { getLogger } from "@rakazo/logging";
+import {
+  CODING_TOOL_RESULTS,
+  COMPACT_CODING_KEEP_RECENT,
+  compactCodingToolResultMessage,
+} from "./context-compaction.js";
 import { imagePartCount, normalizedImageLimit, pruneForRebuild } from "./context-pruning.js";
 import type { CacheRequest, ContextBudget } from "./context-selection.js";
 import {
@@ -491,11 +496,35 @@ export function createRuntimeContextPolicy(
       recentToolResults.add(index);
       wholeResultTokens += tokens;
     }
+    // Coding evidence stays verbatim while the session is short. Once more
+    // than COMPACT_CODING_KEEP_RECENT coding results exist, only the most
+    // recent ones stay whole; older ones collapse to a compact summary.
+    const codingKeep = new Set<number>();
+    {
+      const codingIndexes = messages.flatMap((message, index) =>
+        message.role === "toolResult" &&
+        message.toolName !== undefined &&
+        CODING_TOOL_RESULTS.has(message.toolName)
+          ? [index]
+          : [],
+      );
+      for (const index of codingIndexes.slice(-COMPACT_CODING_KEEP_RECENT)) {
+        codingKeep.add(index);
+      }
+    }
     const shortenOlderResults = (keepRecent: boolean) =>
       messages.map((message, index) => {
+        if (message.role !== "toolResult" || index >= latestToolCall) return message;
+        if (message.toolName !== undefined && CODING_TOOL_RESULTS.has(message.toolName)) {
+          // The most recent coding results stay verbatim; older ones become a
+          // compact summary once the coding window passes the keep count.
+          // codingKeep holds all of them while the session is short, so a
+          // short session is untouched. The count rule governs coding tools
+          // even when the token budget still has room for them whole.
+          if (codingKeep.has(index)) return message;
+          return compactCodingToolResultMessage(message);
+        }
         if (
-          message.role !== "toolResult" ||
-          index >= latestToolCall ||
           (keepRecent && recentToolResults.has(index)) ||
           (message.toolName !== undefined && UNSHORTENED_TOOL_RESULTS.has(message.toolName))
         )

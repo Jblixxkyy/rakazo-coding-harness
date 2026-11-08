@@ -239,7 +239,7 @@ async function click(element: Element | null | undefined) {
   });
 }
 
-function section(role: "main" | "approval") {
+function section(role: "main" | "approval" | "coding") {
   const found = document.querySelector(`[data-testid="model-role-${role}"]`);
   if (!found) throw new Error(`Missing ${role} model list`);
   return found;
@@ -597,6 +597,7 @@ it("shows a Space only its own role lists and makes a new connection its main mo
   try {
     expect(view.container.querySelector('[data-testid="model-role-main"]')).not.toBeNull();
     expect(view.container.querySelector('[data-testid="model-role-approval"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-testid="model-role-coding"]')).not.toBeNull();
     // Connections are the account's, so a Space does not list or add them.
     expect(view.container.querySelector('[data-testid="model-providers"]')).toBeNull();
     expect(models.role).toHaveBeenCalledWith(

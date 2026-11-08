@@ -446,6 +446,36 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "find_definition",
+    description:
+      "Find where a symbol (function, class, interface, type, or const) is defined in this bot's workspace, with file path, line number, and kind. Only real definitions are returned; a file that merely mentions the name yields nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        path: { type: "string" },
+        include: { type: "string" },
+        limit: { type: "number" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "find_references",
+    description:
+      "Find every use of a symbol in this bot's workspace, with file path and line number. The definition itself is excluded.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        path: { type: "string" },
+        include: { type: "string" },
+        limit: { type: "number" },
+      },
+      required: ["name"],
+    },
+  },
+  {
     name: "write_file",
     description:
       "Write a UTF-8 file into this bot's home. On a Team Computer, relative paths use the bot folder; use shared/... only for work other bots should share.",
@@ -476,11 +506,63 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "apply_patch",
     description:
-      "Apply a unified diff to files in this bot's home. Supports adding, updating and deleting files; paths are workspace-relative (a/ and b/ prefixes are stripped). Files are applied in order and the patch stops at the first file that fails; earlier files stay applied.",
+      "Apply a unified diff to files in this bot's home. Supports adding, updating and deleting files; paths are workspace-relative (a/ and b/ prefixes are stripped). Every hunk is validated first, then the patch applies; if a file fails mid-apply, files already changed by this patch are rolled back.",
     inputSchema: {
       type: "object",
       properties: { patchText: { type: "string" } },
       required: ["patchText"],
+    },
+  },
+  {
+    name: "undo_edit",
+    description:
+      "Undo the most recent successful edit or apply_patch batch in this run, restoring the files it changed (including files it deleted). A second undo reports nothing to undo.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "todo_write",
+    description:
+      "Replace this run's whole plan list with the given steps (title, status pending, in_progress, or completed, optional detail). The plan lives only in this run; it is never written to the repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        todos: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              status: { type: "string" },
+              detail: { type: "string" },
+            },
+            required: ["title"],
+          },
+        },
+      },
+      required: ["todos"],
+    },
+  },
+  {
+    name: "todo_read",
+    description: "Read this run's current plan list.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "todo_update",
+    description: "Update one step of this run's plan by id: its status, title, or detail.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        status: { type: "string" },
+        title: { type: "string" },
+        detail: { type: "string" },
+      },
+      required: ["id"],
     },
   },
   {
@@ -529,6 +611,15 @@ export const builtinAgentTools: ConnectorTool[] = [
     name: "diagnostics",
     description:
       "Run this bot's workspace configured checker (type checker, linter, or vet) and report structured errors.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "run_build",
+    description:
+      "Run this bot's workspace build step with its detected builder and report structured errors.",
     inputSchema: {
       type: "object",
       properties: {},

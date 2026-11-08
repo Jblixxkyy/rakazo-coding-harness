@@ -103,7 +103,7 @@ describe("computer lifecycle command guard", () => {
     expect(protectedComputerLifecycleRefusal('for f in *.log; do wc -l "$f"; done')).toBe(
       "unresolved variable $f",
     );
-    expect(protectedComputerLifecycleRefusal('echo "built at $(date)"')).toBe(
+    expect(protectedComputerLifecycleRefusal('echo "built at $(date +%s)"')).toBe(
       "command substitution",
     );
     expect(protectedComputerLifecycleRefusal("echo `date`")).toBe("backtick");
@@ -141,6 +141,45 @@ describe("computer lifecycle command guard", () => {
     ]) {
       expect(protectedComputerLifecycleRefusal(command), command).toBeUndefined();
     }
+  });
+
+  it("allows bare read-only command substitutions and keeps the rest closed", () => {
+    for (const command of [
+      'echo "built at $(date)"',
+      "echo $(pwd)",
+      "echo $(whoami)@$(hostname)",
+      "echo $(uname) $(id)",
+      "echo $(date) $(whoami)",
+      "tar -czf backup.tar.gz src # $(date)",
+      "bash -c 'echo $(date)'",
+      "cat <<EOF\nbuilt $(date)\nEOF",
+      "cat > notes.md <<EOF\nbuilt $(date) by $(whoami)\nEOF",
+      "cat > notes.md <<'EOF'\necho $(date)\nEOF",
+    ]) {
+      expect(protectedComputerLifecycleRefusal(command), command).toBeUndefined();
+    }
+    for (const [command, reason] of [
+      ['echo "built at $(date +%s)"', "command substitution"],
+      ["echo $(date; pkill chromium)", "command substitution"],
+      ["echo $(printf x)", "command substitution"],
+      ["echo $(pwd | base64)", "command substitution"],
+      ["echo $(pkill chromium)", "command substitution"],
+      ["echo $((1 + 1))", "arithmetic expansion"],
+      ["echo `date`", "backtick"],
+      ["cat <<EOF\n$(pkill chromium)\nEOF", "command substitution"],
+      ["cat <<EOF\n$(date +%s)\nEOF", "command substitution"],
+      // Nested inside a parameter expansion, even an allowed name stays refused.
+      ["echo ${x:-" + "$(date)}", "command substitution"],
+    ] as const) {
+      expect(protectedComputerLifecycleRefusal(command), command).toBe(reason);
+    }
+    // The allowed substitution must not smuggle a lifecycle command past the guard.
+    expect(protectedComputerLifecycleRefusal("echo $(date); pkill chromium")).toBe(
+      "protected command pkill",
+    );
+    expect(protectedComputerLifecycleRefusal("echo $(date) && rm -rf ~/.browser-profiles/x")).toBe(
+      "browser profile path",
+    );
   });
 
   it("offers a usable recovery for ordinary file updates refused as an interpreter heredoc", () => {
@@ -187,7 +226,11 @@ connection.close()`;
     expect(protectedComputerLifecycleRefusal('dir=/tmp/$USER; ls "$dir"')).toBe(
       "unresolved variable $dir",
     );
-    expect(protectedComputerLifecycleRefusal('dir=$(pwd); ls "$dir"')).toBe("command substitution");
+    expect(protectedComputerLifecycleRefusal('dir=$(pwd); ls "$dir"')).toBe(
+      // The substitution itself is allowed, but its value is not a literal the
+      // guard can track, so reusing the variable stays refused.
+      "unresolved variable $dir",
+    );
     expect(protectedComputerLifecycleRefusal('dir=/tmp; other="$dir"; ls "$other"')).toBe(
       "unresolved variable $other",
     );

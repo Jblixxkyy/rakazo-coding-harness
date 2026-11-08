@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { FakeSandboxProvider } from "./fake-sandbox.js";
-import { buildRepoMap, formatRepoMapForPrompt, isCodeRelated, repoMapTools } from "./repo-map.js";
+import {
+  buildRepoMap,
+  formatRepoMapForPrompt,
+  invalidateRepoMap,
+  invalidateRepoMapForWorkspace,
+  isCodeRelated,
+  repoMapTools,
+} from "./repo-map.js";
 import type { RunWorkspace } from "./workspace-file-tools.js";
 
 const context = {
@@ -153,6 +160,34 @@ describe("buildRepoMap", () => {
     expect(refreshed).not.toBe(first);
     expect(refreshed.files).toBe(2);
     expect(refreshed.symbols.map((symbol) => symbol.name).sort()).toEqual(["a", "b"]);
+  });
+
+  it("rebuilds after invalidation and keeps serving the cache otherwise", async () => {
+    const { sandbox, computer, workspace } = await seedWorkspace("repo-map-invalidate", {
+      "a.ts": "export function a() {}\n",
+    });
+    const first = await buildRepoMap(sandbox, workspace);
+    // A write with no invalidation leaves the cached map in place.
+    await sandbox.writeFile(
+      computer,
+      { path: "b.ts", content: new TextEncoder().encode("export function b() {}\n") },
+      context,
+    );
+    expect(await buildRepoMap(sandbox, workspace)).toBe(first);
+    // Invalidating after the write makes the next read rebuild with the new file.
+    invalidateRepoMap("repo-map-invalidate", "dedicated");
+    const rebuilt = await buildRepoMap(sandbox, workspace);
+    expect(rebuilt).not.toBe(first);
+    expect(rebuilt.files).toBe(2);
+    expect(rebuilt.symbols.map((symbol) => symbol.name).sort()).toEqual(["a", "b"]);
+    // With nothing changed, the rebuilt map is served from cache again.
+    expect(await buildRepoMap(sandbox, workspace)).toBe(rebuilt);
+    // Invalidating with no write still rebuilds (same content, new object).
+    invalidateRepoMapForWorkspace(workspace);
+    const again = await buildRepoMap(sandbox, workspace);
+    expect(again).not.toBe(rebuilt);
+    expect(again.files).toBe(2);
+    expect(again.symbols).toEqual(rebuilt.symbols);
   });
 
   it("serves the map through the repo_map handler", async () => {

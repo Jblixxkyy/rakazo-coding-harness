@@ -6,15 +6,18 @@ import type {
 } from "@rakazo/adapter-kit";
 import { describe, expect, it } from "vitest";
 import {
+  detectBuild,
   detectChecker,
   detectTestRunner,
   diagnosticsFromTool,
   feedbackTools,
   gitDiffFromTool,
   gitStatusFromTool,
+  parseBuildOutput,
   parseDiagnosticsOutput,
   parseGitStatusOutput,
   parseTestResults,
+  runBuildFromTool,
   runSandboxCommand,
   runTestsFromTool,
 } from "./feedback-tools.js";
@@ -455,5 +458,114 @@ describe("diagnostics", () => {
     const result = parseDiagnosticsOutput(lines, "", 1);
     expect(result.diagnostics).toHaveLength(100);
     expect(result.truncated).toBe(true);
+  });
+
+  it("parses cargo error spans", () => {
+    const stderr = "error[E0308]: mismatched types\n --> src/main.rs:3:5\n  |\n";
+    const result = parseDiagnosticsOutput("", stderr, 101);
+    expect(result).toMatchObject({
+      ok: false,
+      diagnostics: [
+        {
+          path: "src/main.rs",
+          line: 3,
+          column: 5,
+          severity: "error",
+          message: "mismatched types",
+        },
+      ],
+    });
+  });
+});
+
+describe("run_build", () => {
+  it("detects the build script: pnpm with a lockfile, else npm", async () => {
+    const pnpm = new StubSandbox()
+      .file("package.json", JSON.stringify({ scripts: { build: "tsc -b" } }))
+      .file("pnpm-lock.yaml", "lockfileVersion: 9\n");
+    expect(await detectBuild(asSandbox(pnpm), workspace())).toEqual({
+      argv: ["pnpm", "build"],
+    });
+    const npm = new StubSandbox().file(
+      "package.json",
+      JSON.stringify({ scripts: { build: "tsc -b" } }),
+    );
+    expect(await detectBuild(asSandbox(npm), workspace())).toEqual({
+      argv: ["npm", "run", "build"],
+    });
+  });
+
+  it("falls back to tsc, then go build, then cargo build", async () => {
+    const tsc = new StubSandbox().file("package.json", "{}\n").file("tsconfig.json", "{}\n");
+    expect(await detectBuild(asSandbox(tsc), workspace())).toEqual({
+      argv: ["npx", "tsc", "--noEmit"],
+    });
+    const go = new StubSandbox().file("go.mod", "module example.com/x\n");
+    expect(await detectBuild(asSandbox(go), workspace())).toEqual({
+      argv: ["go", "build", "./..."],
+    });
+    const cargo = new StubSandbox().file("Cargo.toml", '[package]\nname = "x"\n');
+    expect(await detectBuild(asSandbox(cargo), workspace())).toEqual({
+      argv: ["cargo", "build"],
+    });
+  });
+
+  it("errors clearly when no build is configured", async () => {
+    const stub = new StubSandbox();
+    expect(await detectBuild(asSandbox(stub), workspace())).toEqual({
+      error: "no build configured",
+    });
+    expect(await runBuildFromTool(asSandbox(stub), workspace(), {})).toEqual({
+      error: "no build configured",
+    });
+    expect(stub.seen).toEqual([]);
+  });
+
+  it("runs the build script and reports success", async () => {
+    const stub = new StubSandbox()
+      .file("package.json", JSON.stringify({ scripts: { build: "tsc -b" } }))
+      .command(["npm", "run", "build"], { stdout: "built in 1.2s\n", code: 0 });
+    const result = await feedbackTools.run_build!(fakeCtx(stub), fakeCall("run_build", {}));
+    expect(stub.seen[0]?.argv).toEqual(["npm", "run", "build"]);
+    expect(stub.seen[0]?.timeoutMs).toBe(300_000);
+    expect(result).toMatchObject({ ok: true, failed: [], summary: "build succeeded" });
+  });
+
+  it("parses a tsc error into a structured failure", async () => {
+    const stub = new StubSandbox()
+      .file("package.json", "{}\n")
+      .file("tsconfig.json", "{}\n")
+      .command(["npx", "tsc", "--noEmit"], {
+        stdout: "src/a.ts(3,5): error TS2322: Type 'string' is not assignable.\n",
+        code: 2,
+      });
+    const result = await runBuildFromTool(asSandbox(stub), workspace(), {});
+    expect(result).toMatchObject({
+      ok: false,
+      failed: [
+        {
+          path: "src/a.ts",
+          line: 3,
+          column: 5,
+          severity: "error",
+          message: "Type 'string' is not assignable.",
+        },
+      ],
+      summary: "1 error",
+    });
+    expect((result as { output: string }).output).toContain("TS2322");
+  });
+
+  it("falls back to the exit code when the failure has no parseable lines", () => {
+    expect(parseBuildOutput("", "boom\n", 1)).toMatchObject({
+      ok: false,
+      failed: [],
+      summary: "build failed with exit code 1",
+    });
+    expect(parseBuildOutput("", "", 0)).toMatchObject({
+      ok: true,
+      failed: [],
+      summary: "build succeeded",
+    });
   });
 });

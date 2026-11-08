@@ -1,7 +1,11 @@
 import type { SandboxProvider } from "@rakazo/adapter-kit";
 import { COMPUTER_COMMAND_OUTPUT_MAX_CHARS } from "@rakazo/contracts";
 import { redactSecrets } from "@rakazo/core";
-import { resolveBotWorkspaceCwd, resolveBotWorkspacePath } from "./computer-support.js";
+import {
+  isolationRootForExecutionId,
+  resolveBotWorkspaceCwd,
+  resolveBotWorkspacePath,
+} from "./computer-support.js";
 import type { RunContext } from "./run-context.js";
 import type { ToolCall, ToolHandlers } from "./run-tool-gate.js";
 import { recordComputerAction, truncateShellOutput } from "./run-tools-computer.js";
@@ -15,6 +19,7 @@ function runWorkspace(ctx: RunContext, call: ToolCall): RunWorkspace {
     markDirty: () => ctx.computer.checkpoint.markDirty(),
     context: ctx.context,
     runSecrets: ctx.secrets,
+    isolationRoot: isolationRootForExecutionId(call.executionId),
   };
 }
 
@@ -41,7 +46,12 @@ export async function runSandboxCommand(
   timeoutMs = 120_000,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   const computer = await workspace.computer();
-  const cwd = resolveBotWorkspaceCwd(workspace.computerMode, workspace.botId, cwdRel);
+  const cwd = resolveBotWorkspaceCwd(
+    workspace.computerMode,
+    workspace.botId,
+    cwdRel,
+    workspace.isolationRoot,
+  );
   let stdout = "";
   let stderr = "";
   let code = 1;
@@ -65,7 +75,12 @@ async function readWorkspaceText(
   try {
     const bytes = await sandbox.readFile(
       await workspace.computer(),
-      resolveBotWorkspacePath(workspace.computerMode, workspace.botId, relPath),
+      resolveBotWorkspacePath(
+        workspace.computerMode,
+        workspace.botId,
+        relPath,
+        workspace.isolationRoot,
+      ),
       workspace.context,
     );
     return new TextDecoder().decode(bytes);
@@ -81,7 +96,7 @@ async function listWorkspaceRootNames(
   try {
     const entries = await sandbox.listFiles(
       await workspace.computer(),
-      resolveBotWorkspacePath(workspace.computerMode, workspace.botId, ""),
+      resolveBotWorkspacePath(workspace.computerMode, workspace.botId, "", workspace.isolationRoot),
       workspace.context,
     );
     return entries.map((entry) => entry.path.split("/").pop() ?? entry.path);
@@ -122,7 +137,15 @@ export async function gitStatusFromTool(
   const result = await runSandboxCommand(
     sandbox,
     workspace,
-    ["git", "status", "--porcelain=v1", "-b", ...(scoped.path ? ["--", scoped.path] : [])],
+    [
+      "git",
+      "status",
+      "--porcelain=v1",
+      "-b",
+      // An isolated helper runs with its folder as cwd; without a path the
+      // status would cover the whole repo, so scope it to this folder.
+      ...(scoped.path ? ["--", scoped.path] : workspace.isolationRoot ? ["--", "."] : []),
+    ],
     scoped.path,
   );
   if (result.code !== 0) {
@@ -169,7 +192,8 @@ export async function gitDiffFromTool(
       "git",
       "diff",
       ...(args.staged === true ? ["--cached"] : []),
-      ...(scoped.path ? ["--", scoped.path] : []),
+      // As with status: an isolated helper's diff covers only its folder.
+      ...(scoped.path ? ["--", scoped.path] : workspace.isolationRoot ? ["--", "."] : []),
     ],
     scoped.path,
   );
@@ -312,7 +336,25 @@ export function parseDiagnosticsOutput(
     }
   }
   if (diagnostics.length === 0) {
+    // Cargo points at the failing span on the line after its `error:` header.
+    let lastReport: { severity: string; message: string } | undefined;
     for (const line of combined.split("\n")) {
+      const header = line.match(/^(error|warning)(?:\[[A-Z]+\d+\])?:\s*(.+)$/);
+      if (header) {
+        lastReport = { severity: header[1]!, message: header[2]!.trim() };
+      }
+      const cargo = line.match(/^\s*-->\s+(.+?):(\d+):(\d+)\s*$/);
+      if (cargo) {
+        const [, path = "", lineNo = "0", colNo = "0"] = cargo;
+        diagnostics.push({
+          path,
+          line: Number(lineNo),
+          column: Number(colNo),
+          severity: lastReport?.severity ?? "error",
+          message: lastReport?.message ?? "build error",
+        });
+        continue;
+      }
       const tsc = line.match(/^(.+?)\((\d+),(\d+)\):\s+(error|warning)\s+(?:TS\d+:\s*)?(.*)$/);
       if (tsc) {
         const [, path = "", lineNo = "0", colNo = "0", severity = "error", message = ""] = tsc;
@@ -400,6 +442,72 @@ export async function diagnosticsFromTool(
   );
 }
 
+/** Detect the build step for this workspace: package.json script, tsc, go, cargo. */
+export async function detectBuild(
+  sandbox: SandboxProvider,
+  workspace: RunWorkspace,
+): Promise<{ argv: string[] } | { error: string }> {
+  const packageJson = await readWorkspaceText(sandbox, workspace, "package.json");
+  if (packageJson !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(packageJson);
+      const scripts = (parsed as { scripts?: Record<string, unknown> } | null)?.scripts;
+      if (scripts?.build) {
+        const lock = await readWorkspaceText(sandbox, workspace, "pnpm-lock.yaml");
+        return { argv: lock !== undefined ? ["pnpm", "build"] : ["npm", "run", "build"] };
+      }
+    } catch {
+      // An unreadable package.json is not a build; keep probing.
+    }
+  }
+  const tsconfig = await readWorkspaceText(sandbox, workspace, "tsconfig.json");
+  if (tsconfig !== undefined && packageJson !== undefined) {
+    return { argv: ["npx", "tsc", "--noEmit"] };
+  }
+  if ((await readWorkspaceText(sandbox, workspace, "go.mod")) !== undefined) {
+    return { argv: ["go", "build", "./..."] };
+  }
+  if ((await readWorkspaceText(sandbox, workspace, "Cargo.toml")) !== undefined) {
+    return { argv: ["cargo", "build"] };
+  }
+  return { error: "no build configured" };
+}
+
+/** Parse a finished build into structured failures and a one-line summary. */
+export function parseBuildOutput(
+  stdout: string,
+  stderr: string,
+  code: number,
+): { ok: boolean; failed: Diagnostic[]; summary: string; output: string } {
+  const parsed = parseDiagnosticsOutput(stdout, stderr, code);
+  const errors = parsed.diagnostics.filter((diagnostic) => diagnostic.severity === "error").length;
+  return {
+    ok: parsed.ok,
+    failed: parsed.diagnostics,
+    summary: parsed.ok
+      ? "build succeeded"
+      : errors > 0
+        ? `${errors} error${errors === 1 ? "" : "s"}${parsed.truncated ? " (truncated)" : ""}`
+        : `build failed with exit code ${code}`,
+    output: parsed.output,
+  };
+}
+
+export async function runBuildFromTool(
+  sandbox: SandboxProvider,
+  workspace: RunWorkspace,
+  _args: Record<string, unknown>,
+) {
+  const detected = await detectBuild(sandbox, workspace);
+  if ("error" in detected) return detected;
+  const result = await runSandboxCommand(sandbox, workspace, detected.argv, undefined, 300_000);
+  return parseBuildOutput(
+    redactSecrets(result.stdout, workspace.runSecrets),
+    redactSecrets(result.stderr, workspace.runSecrets),
+    result.code,
+  );
+}
+
 async function gitCommit(ctx: RunContext, call: ToolCall) {
   const { deps } = ctx;
   const workspace = runWorkspace(ctx, call);
@@ -412,6 +520,11 @@ async function gitCommit(ctx: RunContext, call: ToolCall) {
   if (!message) return fail("message is required");
   const scoped = scopePath(args.path);
   if ("error" in scoped) return fail(scoped.error);
+  if (!scoped.path && workspace.isolationRoot) {
+    // Without a path this would commit whatever is staged anywhere in the
+    // repo; an isolated helper may only commit inside its own folder.
+    return fail(`isolated helpers can only commit inside ${workspace.isolationRoot}/; pass path`);
+  }
   workspace.markDirty();
   try {
     if (scoped.path) {
@@ -473,5 +586,8 @@ export const feedbackTools: ToolHandlers = {
   },
   async diagnostics(ctx, call) {
     return diagnosticsFromTool(ctx.deps.sandbox, runWorkspace(ctx, call), call.args);
+  },
+  async run_build(ctx, call) {
+    return runBuildFromTool(ctx.deps.sandbox, runWorkspace(ctx, call), call.args);
   },
 };

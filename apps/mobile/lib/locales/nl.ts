@@ -22,6 +22,7 @@ export const NL_MESSAGES: Record<string, string> = {
   Block: "Blokkeren",
   "Add a model in Settings to use this.": "Voeg een model toe in Instellingen om dit te gebruiken.",
   "Approval model": "Goedkeuringsmodel",
+  "Coding model": "Coderingsmodel",
   "Main model": "Hoofdmodel",
   "Add fallback": "Back-upmodel toevoegen",
   "Manage {provider}": "{provider} beheren",
