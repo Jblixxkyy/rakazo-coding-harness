@@ -506,6 +506,15 @@ describe("append-only run transcript boundaries", () => {
     run.act(run.send(), "d", "ok");
     run.send();
 
+    // Push the oldest result out of the recent-results window (8) so the
+    // rebuild below must shorten it instead of retaining it verbatim.
+    run.act(run.send(), "e", "ok");
+    run.act(run.send(), "f", "ok");
+    run.act(run.send(), "g", "ok");
+    run.act(run.send(), "h", "ok");
+    run.act(run.send(), "i", "ok");
+    run.send();
+
     // Force a rebuild whose evidence budget cannot retain the oldest result.
     run.state.systemPrompt = "Changed instructions";
     const rebuilt = run.send(undefined, { ...model, contextWindow: 7000, maxTokens: 1024 });
@@ -516,7 +525,7 @@ describe("append-only run transcript boundaries", () => {
     expect(serialized.split("Earlier result shortened after you read it")).toHaveLength(2);
     expect(serialized).not.toContain("unavailable");
     expect(staleThinking(rebuilt)).toEqual([]);
-    run.act(rebuilt, "e", "ok");
+    run.act(rebuilt, "j", "ok");
     const next = run.send();
     expect(extendsPrevious(rebuilt, next)).toBe(true);
     expect(

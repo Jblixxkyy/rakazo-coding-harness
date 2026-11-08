@@ -57,6 +57,8 @@ const MUTATING_TOOLS = new Set(["CRM_UPDATE_RECORD", "CRM_CREATE_NOTE"]);
 const writes = (e: Evidence) => e.calls.filter((c) => MUTATING_TOOLS.has(c.tool));
 const noWrites = (e: Evidence) => check("no-external-writes", writes(e).length === 0);
 const file = (e: Evidence, name: string) => e.files[name]?.trim() ?? "";
+const usedTool = (e: Evidence, name: string) => e.toolNames.includes(name);
+const toolCount = (e: Evidence, name: string) => e.toolNames.filter((tool) => tool === name).length;
 const CUSTOMER_FALLBACK_TOOLS = new Set([
   "browser_navigate",
   "browser_snapshot",
@@ -459,6 +461,318 @@ export const EVAL_CASES: EvalCase[] = [
         /v2\.2\.0/.test(file(e, "results/watched-release.txt")) &&
           /csv/i.test(file(e, "results/watched-release.txt")),
       ),
+      noWrites(e),
+    ],
+  },
+
+  // Coding-harness cases (P0–P3). The offline harness has no way to seed workspace
+  // files: EvalCase.configure only mutates EvalServices (CRM/inbox/GitHub fixtures) and
+  // the fake sandbox starts empty, so each ask first has the agent create the small
+  // repo itself from contents given inline, then perform the task. Grades stay
+  // deterministic: exact resulting file contents plus the tool names the run used.
+  // These cases run only with a live model (the runner marks trials not-run without
+  // --live); the grade functions are covered offline in coding-cases.test.ts.
+  {
+    id: "locate-symbol",
+    purpose:
+      "Find the definition of a named function across a small repo and record its file and line.",
+    steps: [
+      {
+        ask: `First create these files in your home with exactly these contents.
+src/math.ts:
+export function calculateTotal(prices: number[]): number {
+  return prices.reduce((sum, price) => sum + price, 0);
+}
+src/strings.ts:
+export function shout(text: string): string {
+  return text.toUpperCase();
+}
+export function whisper(text: string): string {
+  return text.toLowerCase();
+}
+src/main.ts:
+import { calculateTotal } from "./math";
+export const total = calculateTotal([10, 20, 30]);
+
+Then find the definition of the function named calculateTotal. Search the repo with grep or glob instead of guessing. Save exactly "src/math.ts:1" (file path, colon, line number of the definition) in results/symbol.txt and nothing else.`,
+      },
+    ],
+    files: ["results/symbol.txt"],
+    grade: (e) => [
+      check("exact-symbol-location", file(e, "results/symbol.txt") === "src/math.ts:1"),
+      check("searched-with-grep-or-glob", usedTool(e, "grep") || usedTool(e, "glob")),
+      noWrites(e),
+    ],
+  },
+
+  {
+    id: "multi-file-edit",
+    purpose: "Rename a field in an interface and update both of its call sites.",
+    steps: [
+      {
+        ask: `First create these files in your home with exactly these contents.
+src/types.ts:
+export interface Widget {
+  id: string;
+  label: string;
+}
+src/render.ts:
+import type { Widget } from "./types";
+export function renderWidget(widget: Widget): string {
+  return "[" + widget.id + "] " + widget.label;
+}
+src/list.ts:
+import type { Widget } from "./types";
+export function listWidgets(widgets: Widget[]): string[] {
+  return widgets.map((widget) => widget.label);
+}
+
+Then rename the "label" field to "title" in the Widget interface and update both call sites (src/render.ts and src/list.ts) to use the new name. Do not change anything else.`,
+      },
+    ],
+    files: ["src/types.ts", "src/render.ts", "src/list.ts"],
+    grade: (e) => [
+      check(
+        "interface-renamed",
+        file(e, "src/types.ts").includes("title: string") &&
+          !file(e, "src/types.ts").includes("label"),
+      ),
+      check(
+        "render-call-site-updated",
+        file(e, "src/render.ts").includes("widget.title") &&
+          !file(e, "src/render.ts").includes("label"),
+      ),
+      check(
+        "list-call-site-updated",
+        file(e, "src/list.ts").includes("widget.title") &&
+          !file(e, "src/list.ts").includes("label"),
+      ),
+      noWrites(e),
+    ],
+  },
+
+  {
+    id: "fix-failing-test",
+    purpose: "Run a failing check, patch the bug, and re-run until it passes.",
+    steps: [
+      {
+        ask: `First create these files in your home with exactly these contents.
+src/sum.js:
+export function sum(a, b) {
+  return a - b;
+}
+test/sum-check.mjs:
+import { sum } from "../src/sum.js";
+const ok = sum(2, 3) === 5 && sum(-1, 1) === 0;
+console.log(ok ? "PASS" : "FAIL");
+process.exit(ok ? 0 : 1);
+
+Then run the check with the shell (node test/sum-check.mjs). It will fail. Find and fix the bug in src/sum.js, re-run the check until it prints PASS, and save exactly that final output ("PASS") in results/test-run.txt.`,
+      },
+    ],
+    files: ["src/sum.js", "results/test-run.txt"],
+    grade: (e) => [
+      check(
+        "bug-fixed",
+        file(e, "src/sum.js").includes("a + b") && !file(e, "src/sum.js").includes("a - b"),
+      ),
+      check("test-green", file(e, "results/test-run.txt") === "PASS"),
+      check("test-executed", usedTool(e, "shell") || usedTool(e, "run_tests")),
+      noWrites(e),
+    ],
+  },
+
+  {
+    id: "run-tests-and-report",
+    purpose: "Run the test suite through run_tests and write a pass/fail summary.",
+    steps: [
+      {
+        ask: `First create these files in your home with exactly these contents.
+src/add.js:
+export function add(a, b) {
+  return a + b;
+}
+src/mul.js:
+export function mul(a, b) {
+  return a * b;
+}
+test/check.mjs:
+import { add } from "../src/add.js";
+import { mul } from "../src/mul.js";
+let passed = 0;
+let failed = 0;
+function check(name, actual, expected) {
+  if (actual === expected) {
+    passed += 1;
+  } else {
+    failed += 1;
+    console.log("FAIL " + name);
+  }
+}
+check("add", add(2, 3), 5);
+check("add-negative", add(-1, 1), 0);
+check("mul", mul(3, 4), 12);
+console.log(passed + " passed, " + failed + " failed");
+process.exit(failed ? 1 : 0);
+
+Then run the test suite with the run_tests tool. Save a summary in results/test-report.txt with exactly two lines: the first line "passed: 3" and the second line "failed: 0" (report the real counts if anything actually fails).`,
+      },
+    ],
+    files: ["results/test-report.txt"],
+    grade: (e) => [
+      check(
+        "report-content",
+        file(e, "results/test-report.txt").replaceAll("\r", "") === "passed: 3\nfailed: 0",
+      ),
+      check("used-run-tests", usedTool(e, "run_tests")),
+      noWrites(e),
+    ],
+  },
+
+  {
+    id: "diagnose-type-error",
+    purpose: "Find a seeded type error with the diagnostics tool and fix the declared type.",
+    steps: [
+      {
+        ask: `First create this file in your home with exactly this content.
+src/greet.ts:
+export function greet(name: string): string {
+  return "Hello, " + name;
+}
+export const message: number = greet("Ada");
+
+Then use the diagnostics tool to find the type error in src/greet.ts, fix the declared type so the file typechecks, and leave the greet function itself unchanged.`,
+      },
+    ],
+    files: ["src/greet.ts"],
+    grade: (e) => [
+      check(
+        "type-fixed",
+        file(e, "src/greet.ts").includes("message: string") &&
+          !file(e, "src/greet.ts").includes("message: number"),
+      ),
+      check(
+        "greet-function-unchanged",
+        file(e, "src/greet.ts").includes("greet(name: string): string"),
+      ),
+      check("used-diagnostics", usedTool(e, "diagnostics")),
+      noWrites(e),
+    ],
+  },
+
+  {
+    id: "large-repo-navigation",
+    purpose: "Locate a symbol in a larger seeded tree by searching instead of reading every file.",
+    steps: [
+      {
+        ask: `First create these files in your home with exactly these contents.
+src/users/repo.ts:
+export function findUserByEmail(email: string): string | null {
+  return null;
+}
+src/users/service.ts:
+export function getUser(id: string): string {
+  return id;
+}
+src/users/routes.ts:
+export function userRoutes(): string[] {
+  return ["/users"];
+}
+src/orders/repo.ts:
+export function findOrderById(id: string): string | null {
+  return null;
+}
+src/orders/service.ts:
+export function getOrder(id: string): string {
+  return id;
+}
+src/billing/invoice.ts:
+export function createInvoice(total: number): string {
+  return "INV-" + total;
+}
+src/billing/pricing.ts:
+export function priceInCents(euros: number): number {
+  return euros * 100;
+}
+src/util/format.ts:
+export function formatDate(date: string): string {
+  return date;
+}
+
+Then locate the definition of the function named findUserByEmail. Use grep or glob to search the repo; do not read every file. Save exactly "src/users/repo.ts:1" (file path, colon, line number of the definition) in results/symbol-location.txt and nothing else.`,
+      },
+    ],
+    files: ["results/symbol-location.txt"],
+    grade: (e) => [
+      check(
+        "correct-symbol-location",
+        file(e, "results/symbol-location.txt") === "src/users/repo.ts:1",
+      ),
+      check(
+        "searched-not-scanned",
+        usedTool(e, "grep") || usedTool(e, "glob") || usedTool(e, "repo_map"),
+      ),
+      check("bounded-reads", toolCount(e, "read_file") <= 3),
+      noWrites(e),
+    ],
+  },
+
+  {
+    id: "context-retention-after-many-tools",
+    purpose: "Still use a value read early on correctly after many intervening tool calls.",
+    steps: [
+      {
+        ask: `First create these files in your home with exactly these contents.
+config/app.txt:
+calibration-key: RETENTION-KEY-8842
+data/a.txt:
+alpha record one
+data/b.txt:
+beta record two
+data/c.txt:
+gamma record three
+data/d.txt:
+delta record four
+
+Then read config/app.txt and remember its calibration key. After that, explore the repo with at least 8 tool calls in total: list files, read data/a.txt, data/b.txt, data/c.txt and data/d.txt, and grep for the word "calibration" across the repo. Finally save only the calibration key from config/app.txt in results/final.txt.`,
+      },
+    ],
+    files: ["results/final.txt"],
+    grade: (e) => [
+      check("retained-key", file(e, "results/final.txt") === "RETENTION-KEY-8842"),
+      check("many-tools-used", e.toolNames.length >= 8),
+      noWrites(e),
+    ],
+  },
+
+  {
+    id: "parallel-exploration",
+    purpose: "Explore two parts of the repo in parallel with run_subagent and combine the results.",
+    steps: [
+      {
+        ask: `First create these files in your home with exactly these contents.
+src/auth/session.ts:
+export const SESSION_TTL_HOURS = 12;
+export function createSession(userId: string): string {
+  return "session-" + userId;
+}
+src/billing/pricing.ts:
+export const CURRENCY = "EUR";
+export function priceInCents(euros: number): number {
+  return euros * 100;
+}
+
+Then use run_subagent to explore the auth part and the billing part of this repo in parallel, one subagent per part. Combine what they report into results/combined.txt with exactly two lines: the first line "auth: SESSION_TTL_HOURS=12" and the second line "billing: CURRENCY=EUR".`,
+      },
+    ],
+    files: ["results/combined.txt"],
+    grade: (e) => [
+      check(
+        "combined-content",
+        file(e, "results/combined.txt").replaceAll("\r", "") ===
+          "auth: SESSION_TTL_HOURS=12\nbilling: CURRENCY=EUR",
+      ),
+      check("used-run-subagent", usedTool(e, "run_subagent")),
       noWrites(e),
     ],
   },

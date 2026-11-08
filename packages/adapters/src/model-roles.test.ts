@@ -223,6 +223,33 @@ describe("model roles", () => {
         env: { RAKAZO_AUTO_REVIEW_PROVIDER: "local-provider", RAKAZO_AUTO_REVIEW_MODEL: "judge" },
       }),
     ).toEqual({ primary: { provider: "local-provider", modelId: "judge" }, backups: [] });
+    // A member who set no coding model falls back to the deployment's main
+    // model through the same connection settings; no new env var is involved.
+    expect(deploymentModelRole("coding", deploymentDefaults)).toEqual({
+      primary: { provider: "settings-provider", modelId: "settings-model" },
+      backups: [],
+    });
+  });
+
+  it("selects a member's coding model over the main model when it is passed as main", () => {
+    const coding: MemberMainModel = {
+      provider: "coding-provider",
+      modelId: "coding-model",
+      credential: credential("coding-provider", "coding-model"),
+    };
+    expect(
+      selectConfiguredModel({
+        override: null,
+        overrideCredential: null as never,
+        main: coding,
+        defaults: {},
+      }),
+    ).toEqual({
+      provider: "coding-provider",
+      id: "coding-model",
+      credential: coding.credential,
+      thinkingLevel: null,
+    });
   });
 
   it("uses the deployment's defaults for a member who chose nothing", async () => {

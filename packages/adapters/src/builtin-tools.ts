@@ -391,11 +391,58 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "read_file",
     description:
-      "Read a UTF-8 text file from this bot's home. On a Team Computer, relative paths use the bot folder and shared/... accesses shared work. Open visual or binary files with open_path instead.",
+      "Read a UTF-8 text file from this bot's home. On a Team Computer, relative paths use the bot folder and shared/... accesses shared work. Open visual or binary files with open_path instead. Pass offset (1-based line) and limit (lines) to read part of a long file, and lineNumbers to prefix each line with its line number.",
     inputSchema: {
       type: "object",
-      properties: { path: { type: "string" } },
+      properties: {
+        path: { type: "string" },
+        offset: { type: "integer", description: "1-based first line to return; defaults to 1." },
+        limit: { type: "integer", description: "Maximum lines to return." },
+        lineNumbers: {
+          type: "boolean",
+          description: "Prefix each returned line with its line number.",
+        },
+      },
       required: ["path"],
+    },
+  },
+  {
+    name: "grep",
+    description:
+      "Search workspace files for lines matching a regular expression. Skips ignored directories and .gitignore'd paths; use glob to find files by name instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string" },
+        include: { type: "string" },
+        path: { type: "string" },
+        limit: { type: "number" },
+        caseSensitive: { type: "boolean" },
+      },
+      required: ["pattern"],
+    },
+  },
+  {
+    name: "glob",
+    description:
+      "Find workspace files by name pattern, such as **/*.ts. A pattern with no slash matches the file name at any depth; with a slash it matches the path from the search root.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string" },
+        path: { type: "string" },
+        limit: { type: "number" },
+      },
+      required: ["pattern"],
+    },
+  },
+  {
+    name: "repo_map",
+    description:
+      "Map this bot's workspace: the directory tree plus top-level symbols (functions, classes, interfaces, types) with file paths and line numbers. Cached for 60 seconds; pass refresh true to rebuild it. On a Team Computer, relative paths use the bot folder.",
+    inputSchema: {
+      type: "object",
+      properties: { refresh: { type: "boolean" } },
     },
   },
   {
@@ -409,6 +456,82 @@ export const builtinAgentTools: ConnectorTool[] = [
         content: { type: "string" },
       },
       required: ["path", "content"],
+    },
+  },
+  {
+    name: "edit",
+    description:
+      "Replace one exact occurrence of oldString with newString in a UTF-8 text file in this bot's home. Pass replaceAll to replace every occurrence. Fails when oldString is missing or matches more than once; a single whitespace-tolerant match is accepted when the spacing differs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        oldString: { type: "string" },
+        newString: { type: "string" },
+        replaceAll: { type: "boolean" },
+      },
+      required: ["path", "oldString", "newString"],
+    },
+  },
+  {
+    name: "apply_patch",
+    description:
+      "Apply a unified diff to files in this bot's home. Supports adding, updating and deleting files; paths are workspace-relative (a/ and b/ prefixes are stripped). Files are applied in order and the patch stops at the first file that fails; earlier files stay applied.",
+    inputSchema: {
+      type: "object",
+      properties: { patchText: { type: "string" } },
+      required: ["patchText"],
+    },
+  },
+  {
+    name: "git_status",
+    description:
+      "Show the git status of this bot's workspace, optionally scoped to a path. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+    },
+  },
+  {
+    name: "git_diff",
+    description:
+      "Show the git diff of this bot's workspace, optionally scoped to a path or staged changes. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        staged: { type: "boolean" },
+      },
+    },
+  },
+  {
+    name: "git_commit",
+    description: "Commit the workspace changes with a message. Needs the owner's approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message: { type: "string" },
+        path: { type: "string" },
+      },
+      required: ["message"],
+    },
+  },
+  {
+    name: "run_tests",
+    description:
+      "Run this bot's workspace test suite with its detected runner and report structured results.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "diagnostics",
+    description:
+      "Run this bot's workspace configured checker (type checker, linter, or vet) and report structured errors.",
+    inputSchema: {
+      type: "object",
+      properties: {},
     },
   },
   {
@@ -1339,6 +1462,11 @@ export const builtinAgentTools: ConnectorTool[] = [
         model_id: {
           type: "string",
           description: "Optional connected model ID. Set together with model_provider.",
+        },
+        isolated: {
+          type: "boolean",
+          description:
+            "Confine this helper's writes to its own subagents/<id>/ folder so parallel helpers do not race on the same files. Reads stay workspace-wide.",
         },
       },
       required: ["name", "task"],

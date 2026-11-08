@@ -128,6 +128,16 @@ export function describeToolActivity(toolName: string, args: unknown): string {
   if (toolName === "read_file") return `Reading ${detail(record.path)}`;
   if (toolName === "write_file") return `Writing ${detail(record.path)}`;
   if (toolName === "list_files") return `Listing ${detail(record.path ?? ".")}`;
+  if (toolName === "grep") return `Searching for ${detail(record.pattern)}`;
+  if (toolName === "glob") return `Finding files matching ${detail(record.pattern)}`;
+  if (toolName === "edit") return `Editing ${detail(record.path)}`;
+  if (toolName === "apply_patch") return "Applying a patch";
+  if (toolName === "git_status") return "Checking git status";
+  if (toolName === "git_diff") return "Showing git changes";
+  if (toolName === "git_commit") return `Committing: ${detail(record.message)}`;
+  if (toolName === "run_tests") return "Running tests";
+  if (toolName === "diagnostics") return "Checking for errors";
+  if (toolName === "repo_map") return "Mapping the workspace";
   if (toolName === "attach_file") return `Attaching ${detail(record.path)}`;
   if (toolName === "open_path") return `Opening ${detail(record.path)}`;
   if (toolName === "render_plot") return "Rendering a chart";

@@ -29,6 +29,27 @@ import { deliverFinishedShells } from "./shell-command-stream.js";
 
 export const MAX_PARALLEL_SUBAGENTS = 4;
 
+/**
+ * The workspace folder an isolated subagent writes under, so parallel
+ * helpers never race on the same files. Reads stay workspace-wide; only
+ * writes are confined. Enforcement is by instruction: the subagent shares
+ * the parent run's tool dispatch, so a per-agent workspace root would need
+ * executor-level routing that does not exist yet.
+ */
+export function isolatedSubagentWorkspace(agentId: string): string {
+  const safe = agentId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 64) || "helper";
+  return `subagents/${safe}`;
+}
+
+export function isolatedSubagentInstruction(agentId: string): string {
+  const dir = isolatedSubagentWorkspace(agentId);
+  return (
+    `Work in isolation: read anywhere in the workspace, but write and edit ` +
+    `files only under ${dir}/, so parallel helpers never race on the same ` +
+    `files. Create that folder with your first write if it does not exist.`
+  );
+}
+
 export async function executeSubagent(
   host: ToolHost,
   executionId: string,
@@ -54,6 +75,7 @@ export async function executeSubagent(
 
   const requestedProvider = String(args.model_provider ?? "").trim();
   const requestedModelId = String(args.model_id ?? "").trim();
+  const isolated = args.isolated === true;
   const hasBackups = Boolean(host.request.fallbackModels?.length);
   let requestModel = hasBackups ? host.activeModel.config : host.request.model;
   try {
@@ -240,6 +262,7 @@ export async function executeSubagent(
         "Your task comes from the parent bot, not from the human user, and you cannot talk to the user: report your result back to the parent bot.",
         "Messages marked as automated come from Rakazo, not from the user.",
         extra,
+        isolated ? isolatedSubagentInstruction(agentId) : "",
       ]
         .filter(Boolean)
         .join(" "),

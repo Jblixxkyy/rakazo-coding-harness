@@ -1,6 +1,9 @@
 import type { AgentToolExecutionObserver } from "@rakazo/adapter-kit";
 import { toolResultTaintsRun } from "@rakazo/core";
+import { editTools } from "./edit-tools.js";
+import { feedbackTools } from "./feedback-tools.js";
 import { IMAGE_RETURNING_COMPUTER_TOOLS, MODEL_CANNOT_SEE_MESSAGE } from "./model-vision.js";
+import { repoMapTools } from "./repo-map.js";
 import type { RunContext } from "./run-context.js";
 import { pauseForApproval } from "./run-context.js";
 import type { ToolHandler } from "./run-tool-gate.js";
@@ -17,11 +20,16 @@ import { purchaseTools } from "./run-tools-purchases.js";
 import { secretTools } from "./run-tools-secrets.js";
 import { taskTools } from "./run-tools-tasks.js";
 import { USER_COMPUTER_SHELL_TOOL, userComputerShell } from "./run-tools-user-computer.js";
+import { searchTools } from "./search-tools.js";
 import { argumentGiven } from "./update-bot-patch.js";
 
 const TOOL_HANDLERS = new Map<string, ToolHandler>([
   ...Object.entries(computerTools),
   ...Object.entries(fileTools),
+  ...Object.entries(searchTools),
+  ...Object.entries(editTools),
+  ...Object.entries(feedbackTools),
+  ...Object.entries(repoMapTools),
   ...Object.entries(memoryTools),
   ...Object.entries(integrationTools),
   ...Object.entries(taskTools),

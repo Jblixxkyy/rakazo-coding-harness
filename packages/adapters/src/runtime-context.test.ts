@@ -51,7 +51,7 @@ function enableHistoryRetrieval(request: AgentRunRequest) {
 }
 function connectorPages() {
   const { request, context } = fixture(0);
-  const bodies = Array.from({ length: 14 }, (_, index) => `Page ${index}: ${"0".repeat(9500)}`);
+  const bodies = Array.from({ length: 14 }, (_, index) => `Page ${index}: ${"0".repeat(6000)}`);
   context.messages.push({
     role: "assistant",
     content: bodies.map((_, index) => ({
@@ -314,6 +314,7 @@ describe("runtime context policy", () => {
       content: `---\nname: daily-brief\n---\n${"1. Step kept for skill_update.\n".repeat(80)}`,
     });
     const shellOutput = "synthetic shell output ".repeat(3000);
+    const shellIds = Array.from({ length: 9 }, (_, index) => `shell-${index + 1}`);
     context.messages.push(
       call("read", "skill_read"),
       result("read", "skill_read", skill),
@@ -321,22 +322,15 @@ describe("runtime context policy", () => {
       result(
         "fleet",
         "list_fleet",
-        JSON.stringify({ bot: { instructionsVersion: "v2", instructions: "0".repeat(20_000) } }),
+        JSON.stringify({ bot: { instructionsVersion: "v2", instructions: "0".repeat(10_000) } }),
       ),
-      call("shell-1", "shell"),
-      result("shell-1", "shell", shellOutput),
-      call("shell-2", "shell"),
-      result("shell-2", "shell", shellOutput),
-      call("shell-3", "shell"),
-      result("shell-3", "shell", shellOutput),
-      call("shell-4", "shell"),
-      result("shell-4", "shell", shellOutput),
+      ...shellIds.flatMap((id) => [call(id, "shell"), result(id, "shell", shellOutput)]),
     );
     const policy = createRuntimeContextPolicy({
       ...request,
       contextStrategy: DEFAULT_CONTEXT_STRATEGY,
     });
-    const prepared = policy.prepareContext(context, { ...model, contextWindow: 100_000 });
+    const prepared = policy.prepareContext(context, { ...model, contextWindow: 200_000 });
     const body = (id: string) => {
       const message = prepared.messages.find(
         (message) => message.role === "toolResult" && message.toolCallId === id,
@@ -344,15 +338,59 @@ describe("runtime context policy", () => {
       return message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
     };
     expect(body("fleet")).toBe(
-      JSON.stringify({ bot: { instructionsVersion: "v2", instructions: "0".repeat(20_000) } }),
+      JSON.stringify({ bot: { instructionsVersion: "v2", instructions: "0".repeat(10_000) } }),
     );
     expect(skill.length).toBeGreaterThan(2500);
     expect(body("read")).toBe(skill);
     expect(body("shell-1")).toContain("[Earlier result shortened after you read it");
     expect(body("shell-1")).not.toContain("unavailable");
-    for (const id of ["shell-2", "shell-3", "shell-4"]) {
+    for (const id of shellIds.slice(1)) {
       expect(body(id)).toBe(shellOutput);
     }
+  });
+  it("keeps coding-tool results verbatim while shortening other old tool evidence", () => {
+    const { request, context } = fixture(0);
+    const call = (id: string, name: string) =>
+      ({
+        role: "assistant",
+        content: [{ type: "toolCall", id, name, arguments: {} }],
+        timestamp: 101,
+      }) as unknown as Message;
+    const result = (id: string, name: string, body: string) =>
+      ({
+        role: "toolResult",
+        toolCallId: id,
+        toolName: name,
+        content: [{ type: "text", text: body }],
+        isError: false,
+        timestamp: 102,
+      }) as Message;
+    const codingBody = "exact coding evidence ".repeat(3000);
+    const shellOutput = "synthetic shell output ".repeat(3000);
+    const shellIds = Array.from({ length: 9 }, (_, index) => `shell-${index + 1}`);
+    context.messages.push(
+      call("file", "read_file"),
+      result("file", "read_file", codingBody),
+      call("map", "repo_map"),
+      result("map", "repo_map", codingBody),
+      call("diff", "git_diff"),
+      result("diff", "git_diff", codingBody),
+      ...shellIds.flatMap((id) => [call(id, "shell"), result(id, "shell", shellOutput)]),
+      call("later", "shell"),
+      result("later", "shell", "ok"),
+    );
+    const prepared = createRuntimeContextPolicy({
+      ...request,
+      contextStrategy: DEFAULT_CONTEXT_STRATEGY,
+    }).prepareContext(context, { ...model, contextWindow: 100_000 });
+    const body = (id: string) => {
+      const message = prepared.messages.find(
+        (message) => message.role === "toolResult" && message.toolCallId === id,
+      ) as Extract<Message, { role: "toolResult" }>;
+      return message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+    };
+    for (const id of ["file", "map", "diff"]) expect(body(id)).toBe(codingBody);
+    expect(body("shell-1")).toContain("[Earlier result shortened after you read it");
   });
   it.each([65_536, 10_000])(
     "retains individual parallel results within a %i budget",

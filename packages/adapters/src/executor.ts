@@ -98,6 +98,7 @@ import { HostedModelCreditsRequiredError } from "./model-credit-observer.js";
 import {
   effectiveModelRole,
   resolveMemberMainModel,
+  resolveMemberRoleModel,
   selectConfiguredModel,
 } from "./model-roles.js";
 import {
@@ -112,6 +113,7 @@ import { paymentWalletConnected } from "./payment-wallets.js";
 import { isRetiredModelCredentialError } from "./pi-oauth.js";
 import { loadPurchaseRedactions } from "./purchase-service.js";
 import { loadReplyContext, messageToAgentHistoryText } from "./reply-context.js";
+import { buildRepoMap, formatRepoMapForPrompt, isCodeRelated } from "./repo-map.js";
 import { backOffRoutineAfterAccountError } from "./routine-backoff.js";
 import { lateRoutineRunInstruction } from "./routine-lateness.js";
 import { lazyRunComputer } from "./run-computer.js";
@@ -506,6 +508,15 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           deps.paymentWallet ? loadPurchaseRedactions(deps, run) : [],
           loadRunLoginRedactions(deps.prisma, deps.secretStore, run, run.id),
         ]);
+        // A member who set a coding model gets it for code-related runs; everyone
+        // else keeps the main model. Bot overrides and pins still win in
+        // selectConfiguredModel below, and a missing coding model changes nothing.
+        const codingMain = isCodeRelated(task.prompt)
+          ? await resolveMemberRoleModel(deps, run, "coding").catch((error: unknown) => {
+              getLogger().warn("Coding model could not be loaded", { runId, error });
+              return null;
+            })
+          : null;
         const historySearchBeforeSeq =
           contextStrategy !== "current" && run.sourceMessageId
             ? (messages.find((message) => message.id === run.sourceMessageId)?.seq ??
@@ -753,7 +764,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         const selected = selectConfiguredModel({
           override: modelChoice,
           overrideCredential,
-          main,
+          main: codingMain ?? main,
           hostedProvider: (await modelCreditBillingEnabled(deps))
             ? resolveDeploymentModel().provider
             : undefined,
@@ -793,7 +804,7 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
         const loadBackups = () =>
           (backupChoices ??= scripted
             ? Promise.resolve([])
-            : effectiveModelRole(deps.prisma, run, "main", {
+            : effectiveModelRole(deps.prisma, run, codingMain ? "coding" : "main", {
                 settings,
                 deployment: runDeployment,
               }).then(
@@ -1503,6 +1514,26 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
           return true;
         };
 
+        // Code-related runs get the cached repo map in the system prompt so the
+        // model can navigate without reading every file first. A map failure
+        // never fails the run: the repo_map, grep, and glob tools stay available.
+        let repoMapInstruction: string | undefined;
+        if (isCodeRelated(task.prompt)) {
+          try {
+            const map = await buildRepoMap(deps.sandbox, {
+              botId: bot.id,
+              computerMode: ctx.computer.mode,
+              computer: () => ctx.computer.get("tool", "repo_map"),
+              markDirty: () => ctx.computer.checkpoint.markDirty(),
+              context: ctx.context,
+              runSecrets,
+            });
+            repoMapInstruction = formatRepoMapForPrompt(map);
+          } catch (error) {
+            getLogger().warn("Repo map could not be built for this run", { runId, error });
+          }
+        }
+
         try {
           if (checkpointLoadError) throw checkpointLoadError;
           const runtimeEvents = deps.runtime.run(
@@ -1526,35 +1557,40 @@ export function createRunExecutor(executorDeps: ExecutorDeps) {
               // Keep an explicit executor override, but let the runtime select
               // cache-aware context for connections declaring a cache window.
               contextStrategy: deps.contextStrategy,
-              instructions: userTurnInstructions({
-                botInstructions: runIdentityInstruction(bot, run.trigger),
-                groupContext,
-                messagingContext,
-                redactedMemoryContext: memoryContext
-                  ? redactSecrets(memoryContext, runSecrets)
-                  : undefined,
-                redactedScratchpadContext: scratchpadContext
-                  ? redactSecrets(scratchpadContext, runSecrets)
-                  : undefined,
-                redactedTicketContext: ticketContext
-                  ? redactSecrets(ticketContext, runSecrets)
-                  : undefined,
-                hasHistoricalContext: historicalContext.length > 0,
-                historyRetrievalEnabled: contextStrategy !== "current",
-                computerInstruction,
-                pageBrowserAllowed,
-                taskCatalogInstruction,
-                workspaceInstruction,
-                agentEnvironmentInstruction,
-                botDirectory,
-                pluginLine,
-                agentSkillsLine,
-                taughtSkillsLine,
-                replyGuidance: runReplyGuidance(run.trigger),
-                disabledBuiltinTools,
-                offeredFleetTools: offeredFleetTools(builtins),
-                userComputer,
-              })
+              instructions: [
+                userTurnInstructions({
+                  botInstructions: runIdentityInstruction(bot, run.trigger),
+                  groupContext,
+                  messagingContext,
+                  redactedMemoryContext: memoryContext
+                    ? redactSecrets(memoryContext, runSecrets)
+                    : undefined,
+                  redactedScratchpadContext: scratchpadContext
+                    ? redactSecrets(scratchpadContext, runSecrets)
+                    : undefined,
+                  redactedTicketContext: ticketContext
+                    ? redactSecrets(ticketContext, runSecrets)
+                    : undefined,
+                  hasHistoricalContext: historicalContext.length > 0,
+                  historyRetrievalEnabled: contextStrategy !== "current",
+                  computerInstruction,
+                  pageBrowserAllowed,
+                  taskCatalogInstruction,
+                  workspaceInstruction,
+                  agentEnvironmentInstruction,
+                  botDirectory,
+                  pluginLine,
+                  agentSkillsLine,
+                  taughtSkillsLine,
+                  replyGuidance: runReplyGuidance(run.trigger),
+                  disabledBuiltinTools,
+                  offeredFleetTools: offeredFleetTools(builtins),
+                  userComputer,
+                })
+                  .filter((instruction): instruction is string => Boolean(instruction))
+                  .join("\n\n"),
+                repoMapInstruction,
+              ]
                 .filter((instruction): instruction is string => Boolean(instruction))
                 .join("\n\n"),
               history: runtimeHistory,

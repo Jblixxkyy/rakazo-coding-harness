@@ -4,7 +4,7 @@ import { ModelBackupChoiceSchema, modelChoiceListSchema, ThinkingLevelSchema } f
 import { Id } from "./ids.js";
 
 /** Add purposes here; connections, persistence, pickers and backups stay shared. */
-export const ModelRoleSchema = z.enum(["main", "approval"]);
+export const ModelRoleSchema = z.enum(["main", "approval", "coding"]);
 export type ModelRole = z.infer<typeof ModelRoleSchema>;
 export const ModelRoleChoiceSchema = ModelBackupChoiceSchema.extend({
   thinkingLevel: ThinkingLevelSchema.nullable().optional(),

@@ -17,7 +17,7 @@ import { effectiveOutputReserve, resolveCompletionMaxTokens } from "./pi-runtime
 import { withoutThinkingFrom } from "./thinking-signatures.js";
 
 /** Minimum whole-result window, unless the full model budget requires clipping. */
-const RECENT_TOOL_RESULTS_TO_KEEP = 3;
+const RECENT_TOOL_RESULTS_TO_KEEP = 8;
 
 const accountSalt = randomBytes(32);
 const sharedCacheTracker = new ContextCacheTracker();
@@ -29,9 +29,19 @@ const projections = new Map<string, ProjectionEntry[]>();
 /** Keep editable source and fleet instruction versions intact; these tools bound their own output. */
 export const VERBATIM_TOOL_RESULTS: ReadonlySet<string> = new Set(["skill_read", "list_fleet"]);
 // History reads are exact evidence and keep their own offset-aware shortening elsewhere.
+// Coding-tool results are exact evidence too: the model needs file contents, matches,
+// diffs and the repo map verbatim, not a shortened snapshot of them.
 const UNSHORTENED_TOOL_RESULTS = new Set([
   "read_history",
   "search_history",
+  "read_file",
+  "grep",
+  "glob",
+  "edit",
+  "apply_patch",
+  "repo_map",
+  "git_diff",
+  "git_status",
   ...VERBATIM_TOOL_RESULTS,
 ]);
 const messageHash = (message: Message) =>

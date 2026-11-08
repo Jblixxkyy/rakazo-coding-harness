@@ -71,6 +71,32 @@ function appendComputerCommand(ctx: RunContext, payload: ComputerCommand) {
   );
 }
 
+/**
+ * Cap shell output at maxChars keeping the head and the tail, with a marker naming how many
+ * chars were cut from the middle. Output that already fits is returned unchanged.
+ */
+export function truncateShellOutput(
+  output: string,
+  maxChars: number = COMPUTER_COMMAND_OUTPUT_MAX_CHARS,
+): string {
+  if (output.length <= maxChars) return output;
+  const markerFor = (omitted: number) => `[output truncated: ${omitted} chars]\n`;
+  let head = 0;
+  let tail = 0;
+  let marker = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    marker = markerFor(output.length - head - tail);
+    const keep = maxChars - marker.length;
+    if (keep <= 0) return output.slice(-maxChars);
+    const nextHead = Math.ceil(keep / 2);
+    const nextTail = keep - nextHead;
+    if (nextHead === head && nextTail === tail) break;
+    head = nextHead;
+    tail = nextTail;
+  }
+  return output.slice(0, head) + marker + output.slice(output.length - tail);
+}
+
 /** Record a finished file/app action for the terminal's Activity view. */
 export function recordComputerAction(
   ctx: RunContext,
@@ -383,7 +409,7 @@ export const computerTools: ToolHandlers = {
             ...commandEvent,
             status: "done",
             exitCode: final.code,
-            output: commandOutput(final, false).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
+            output: truncateShellOutput(commandOutput(final, false)),
           });
           return final;
         });
@@ -405,7 +431,7 @@ export const computerTools: ToolHandlers = {
         ...commandEvent,
         status: "done",
         exitCode: redacted.code,
-        output: commandOutput(redacted, false).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
+        output: truncateShellOutput(commandOutput(redacted, false)),
       });
       return call.finish(redacted);
     } catch (error) {
@@ -413,10 +439,9 @@ export const computerTools: ToolHandlers = {
         ...commandEvent,
         status: "done",
         exitCode: 1,
-        output: redactSecrets(
-          error instanceof Error ? error.message : "command failed",
-          ctx.secrets,
-        ).slice(-COMPUTER_COMMAND_OUTPUT_MAX_CHARS),
+        output: truncateShellOutput(
+          redactSecrets(error instanceof Error ? error.message : "command failed", ctx.secrets),
+        ),
       });
       throw error;
     }

@@ -28,6 +28,11 @@ export type RunWorkspace = {
 };
 
 const MAX_MODEL_FILE_BYTES = 250_000;
+// The sandbox readFile primitive has no byte offset, so a paged slice of a
+// file larger than the model cap cannot be read through that cap. Paged reads
+// therefore read up to 1MB internally and return at most `limit` lines to the
+// model; non-paged reads keep the 250KB cap.
+const MAX_PAGED_FILE_BYTES = 1_000_000;
 
 export async function listFilesFromTool(
   sandbox: SandboxProvider,
@@ -61,11 +66,22 @@ export async function readFileFromTool(
 ) {
   const { botId, computerMode, computer, context, runSecrets } = workspace;
   const filePath = String(args.path ?? "");
+  const offset = args.offset === undefined ? undefined : Number(args.offset);
+  const limit = args.limit === undefined ? undefined : Number(args.limit);
+  const lineNumbers = args.lineNumbers === true;
+  if (offset !== undefined && (!Number.isInteger(offset) || offset < 1)) {
+    return { error: "offset must be a positive integer", path: filePath };
+  }
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+    return { error: "limit must be a positive integer", path: filePath };
+  }
+  const paged = offset !== undefined || limit !== undefined || lineNumbers;
+  const maxBytes = paged ? MAX_PAGED_FILE_BYTES : MAX_MODEL_FILE_BYTES;
   const storedPath = resolveBotWorkspacePath(computerMode, botId, filePath);
   let bytes: Uint8Array;
   try {
     bytes = await sandbox.readFile(await computer(), storedPath, context, {
-      maxBytes: MAX_MODEL_FILE_BYTES,
+      maxBytes,
     });
   } catch (error) {
     if (error instanceof Error && /exceeds \d+ bytes/.test(error.message)) {
@@ -76,24 +92,45 @@ export async function readFileFromTool(
     }
     throw error;
   }
-  if (bytes.byteLength > MAX_MODEL_FILE_BYTES) {
+  if (bytes.byteLength > maxBytes) {
     return {
       error: "file is too large for model context",
       path: filePath,
       size: bytes.byteLength,
     };
   }
+  let content: string;
   try {
-    return {
-      path: filePath,
-      content: redactSecrets(new TextDecoder("utf-8", { fatal: true }).decode(bytes), runSecrets),
-    };
+    content = redactSecrets(new TextDecoder("utf-8", { fatal: true }).decode(bytes), runSecrets);
   } catch {
     return {
       error: "file is not UTF-8 text; use open_path to inspect it",
       path: filePath,
     };
   }
+  if (!paged) {
+    return { path: filePath, content };
+  }
+  // A trailing newline terminates the last line rather than starting an empty one.
+  const allLines = content === "" ? [] : content.split("\n");
+  if (content.endsWith("\n")) allLines.pop();
+  const totalLines = allLines.length;
+  const startLine = offset ?? 1;
+  const slice = allLines.slice(
+    startLine - 1,
+    limit === undefined ? undefined : startLine - 1 + limit,
+  );
+  const endLine = startLine + slice.length - 1;
+  return {
+    path: filePath,
+    content: slice
+      .map((line, index) => (lineNumbers ? `${startLine + index}: ${line}` : line))
+      .join("\n"),
+    totalLines,
+    startLine,
+    endLine,
+    truncated: endLine < totalLines,
+  };
 }
 
 /** render_plot: returns the chart guide or catalog, or renders a chart into the workspace and chat. */

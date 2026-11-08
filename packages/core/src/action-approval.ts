@@ -11,6 +11,15 @@ const APPROVAL_EXEMPT_TOOLS = new Set([
   "read_history",
   "search_history",
   "write_file",
+  "grep",
+  "glob",
+  "edit",
+  "apply_patch",
+  "git_status",
+  "git_diff",
+  "run_tests",
+  "diagnostics",
+  "repo_map",
   "shell",
   "open_path",
   "launch_app",
@@ -42,6 +51,7 @@ const APPROVAL_REQUIRED_BUILTIN_TOOLS = new Set([
   "cloud_agent_reply",
   "cloud_agent_cancel",
   "user_computer_shell",
+  "git_commit",
 ]);
 const EXPLICIT_APPROVAL_BUILTIN_TOOLS = new Set([
   "respond_agent_connection",
@@ -63,6 +73,11 @@ const UNATTENDED_SAFE_BUILTIN_TOOLS = new Set([
   "list_secrets",
   "purchase_status",
   "read_file",
+  "grep",
+  "glob",
+  "git_status",
+  "git_diff",
+  "repo_map",
   "recall_memory",
   "request_takeover",
   "run_subagent",
@@ -235,6 +250,9 @@ const OWN_STATE_RESULT_TOOLS = new Set([
   "skill_read",
   "task_catalog",
   "write_file",
+  "edit",
+  "apply_patch",
+  "git_commit",
 ]);
 
 export function toolResultTaintsRun(toolName: string): boolean {

@@ -24,6 +24,7 @@ import { RetiredModelCredentialError, serializeModelSecret } from "./pi-oauth.js
 import { modelsForRequest, resolveRuntimeModel } from "./pi-runtime-models.js";
 import {
   dockerComputerToolInstruction,
+  FILE_TOOL_NAMES,
   persistentComputerInstruction,
   threadContextForRun,
   userTurnInstructions,
@@ -1759,7 +1760,7 @@ describe("persistentComputerInstruction", () => {
           graphical,
           disabled: new Set(disabled),
         });
-      const filesOff = ["list_files", "read_file", "write_file", "attach_file"];
+      const filesOff = [...FILE_TOOL_NAMES];
       expect(instruction(["shell"])).not.toContain("shell");
       expect(instruction(["shell"])).toContain("filesystem");
       expect(instruction(filesOff)).not.toContain("filesystem");

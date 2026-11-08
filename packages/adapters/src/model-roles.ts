@@ -70,12 +70,13 @@ export type MemberMainModel = ModelRoleChoice & {
   credential: ModelCredential;
 };
 
-/** The member's main model and the connection that serves it, resolved as validation does. */
-export async function resolveMemberMainModel(
+/** The member's model for one purpose and the connection that serves it, resolved as validation does. */
+export async function resolveMemberRoleModel(
   deps: { prisma: PrismaClient; secretStore: Pick<SecretStore, "load"> },
   scope: { userId: string; spaceId: string },
+  role: ModelRole,
 ): Promise<MemberMainModel | null> {
-  const { primary } = await appliedModelRole(deps.prisma, scope, "main");
+  const { primary } = await appliedModelRole(deps.prisma, scope, role);
   if (!primary) return null;
   const credential = await findConnectedModelCredential(
     deps.prisma,
@@ -86,6 +87,14 @@ export async function resolveMemberMainModel(
     { credentialId: primary.credentialId },
   );
   return { ...primary, credential };
+}
+
+/** The member's main model and the connection that serves it, resolved as validation does. */
+export async function resolveMemberMainModel(
+  deps: { prisma: PrismaClient; secretStore: Pick<SecretStore, "load"> },
+  scope: { userId: string; spaceId: string },
+): Promise<MemberMainModel | null> {
+  return resolveMemberRoleModel(deps, scope, "main");
 }
 
 /** Select configuration without loading secrets or applying a runtime-specific fallback. */
