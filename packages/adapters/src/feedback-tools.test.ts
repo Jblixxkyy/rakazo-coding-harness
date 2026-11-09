@@ -569,3 +569,104 @@ describe("run_build", () => {
     });
   });
 });
+
+describe("subfolder project detection (live bug: add-demo/)", () => {
+  /** The exact project jblixky's bot built live: root has no package.json. */
+  function addDemoStub() {
+    return new StubSandbox()
+      .file(
+        "add-demo/package.json",
+        JSON.stringify({
+          scripts: { test: "node --test", build: "node build.js" },
+        }),
+      )
+      .file(
+        "add-demo/src/math.js",
+        "function add(a, b) {\n  return a - b;\n}\nmodule.exports = { add };\n",
+      )
+      .file(
+        "add-demo/test/math.test.js",
+        "const { add } = require('../src/math.js');\nif (add(2, 3) !== 5) throw new Error('add broken');\n",
+      );
+  }
+
+  it("finds the test runner in a subfolder and runs it there", async () => {
+    const stub = addDemoStub();
+    expect(await detectTestRunner(asSandbox(stub), workspace())).toEqual({
+      argv: ["npm", "test"],
+      cwd: "add-demo",
+    });
+    stub.command(["npm", "test"], { stdout: "Tests: 0 failed, 1 passed\n", code: 0 });
+    const result = await runTestsFromTool(asSandbox(stub), workspace(), {});
+    expect(stub.seen[0]?.argv).toEqual(["npm", "test"]);
+    expect(stub.seen[0]?.cwd).toBe("add-demo");
+    expect(result).toMatchObject({ ok: true, summary: "0 failed, 1 passed" });
+  });
+
+  it("finds the build script in a subfolder and runs it there", async () => {
+    const stub = addDemoStub();
+    expect(await detectBuild(asSandbox(stub), workspace())).toEqual({
+      argv: ["npm", "run", "build"],
+      cwd: "add-demo",
+    });
+    stub.command(["npm", "run", "build"], { stdout: "build ok\n", code: 0 });
+    const result = await runBuildFromTool(asSandbox(stub), workspace(), {});
+    expect(stub.seen[0]?.cwd).toBe("add-demo");
+    expect(result).toMatchObject({ ok: true, summary: "build succeeded" });
+  });
+
+  it("finds a subfolder tsconfig for diagnostics", async () => {
+    const stub = addDemoStub()
+      .file("add-demo/tsconfig.json", "{}\n")
+      .command(["npx", "tsc", "--noEmit"], { stdout: "", code: 0 });
+    expect(await detectChecker(asSandbox(stub), workspace())).toEqual({
+      argv: ["npx", "tsc", "--noEmit"],
+      cwd: "add-demo",
+    });
+    const result = await diagnosticsFromTool(asSandbox(stub), workspace(), {});
+    expect(stub.seen[0]?.cwd).toBe("add-demo");
+    expect(result).toMatchObject({ ok: true, diagnostics: [] });
+  });
+
+  it("falls back to node --test for plain test files with no package.json", async () => {
+    const stub = new StubSandbox().file(
+      "add-demo/test/math.test.js",
+      "const { add } = require('../src/math.js');\n",
+    );
+    expect(await detectTestRunner(asSandbox(stub), workspace())).toEqual({
+      argv: ["node", "--test"],
+      cwd: "add-demo",
+    });
+    const rootStub = new StubSandbox().file("test/foo.test.js", "test('x', () => {});\n");
+    expect(await detectTestRunner(asSandbox(rootStub), workspace())).toEqual({
+      argv: ["node", "--test"],
+    });
+  });
+
+  it("falls back to node --check for plain JS with no configured checker", async () => {
+    const stub = addDemoStub().command(["node", "--check", "src/math.js"], {
+      stdout: "",
+      code: 0,
+    });
+    const result = await diagnosticsFromTool(asSandbox(stub), workspace(), {});
+    expect(stub.seen[0]?.argv).toEqual(["node", "--check", "src/math.js"]);
+    expect(stub.seen[0]?.cwd).toBe("add-demo");
+    expect(result).toMatchObject({ ok: true, diagnostics: [] });
+  });
+
+  it("reports a node --check syntax error as a structured diagnostic", async () => {
+    const stub = new StubSandbox()
+      .file("add-demo/src/math.js", "function add(a, b) {\n")
+      .command(["node", "--check", "src/math.js"], {
+        stderr: "src/math.js:1\nfunction add(a, b) {\n\nSyntaxError: Unexpected token\n",
+        code: 1,
+      });
+    const result = await diagnosticsFromTool(asSandbox(stub), workspace(), {});
+    expect(result).toMatchObject({
+      ok: false,
+      diagnostics: [
+        { path: "src/math.js", line: 1, severity: "error", message: "Unexpected token" },
+      ],
+    });
+  });
+});

@@ -89,20 +89,190 @@ async function readWorkspaceText(
   }
 }
 
-async function listWorkspaceRootNames(
+/** A detected command, plus the project folder to run it in (root when absent). */
+export type DetectedCommand = { argv: string[]; cwd?: string };
+
+/** Directories never treated as a project folder, mirroring search-tools. */
+const IGNORED_DIR_NAMES = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  ".next",
+  "build",
+  "coverage",
+  ".venv",
+  "__pycache__",
+]);
+
+/** Immediate subfolders scanned for a project; the workspace root is always first. */
+const MAX_PROJECT_SUBDIRS = 20;
+/** Subfolders peeked into for test/source files (test files live one level down). */
+const PEEK_DIR_NAMES = new Set(["test", "tests", "src", "lib", "app"]);
+/** Cap on files syntax-checked by the node --check fallback. */
+const MAX_NODE_CHECK_FILES = 20;
+
+const TEST_FILE_RE = /\.(?:test|spec)\.(?:js|ts|mjs|cjs|jsx|tsx)$/;
+const JS_FILE_RE = /\.(?:js|mjs|cjs)$/;
+const PY_TEST_FILE_RE = /^(test_.*\.py|.*_test\.py)$/;
+
+function joinRel(dir: string, name: string): string {
+  return dir ? `${dir}/${name}` : name;
+}
+
+type DirEntry = { name: string; kind: "file" | "dir" };
+
+async function listWorkspaceEntries(
   sandbox: SandboxProvider,
   workspace: RunWorkspace,
-): Promise<string[]> {
+  relDir: string,
+): Promise<DirEntry[]> {
   try {
     const entries = await sandbox.listFiles(
       await workspace.computer(),
-      resolveBotWorkspacePath(workspace.computerMode, workspace.botId, "", workspace.isolationRoot),
+      resolveBotWorkspacePath(
+        workspace.computerMode,
+        workspace.botId,
+        relDir,
+        workspace.isolationRoot,
+      ),
       workspace.context,
     );
-    return entries.map((entry) => entry.path.split("/").pop() ?? entry.path);
+    return entries
+      .map((entry) => ({
+        name: entry.path.split("/").pop() ?? entry.path,
+        kind: entry.kind,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
   } catch {
     return [];
   }
+}
+
+/**
+ * One project folder: the workspace root or an immediate subfolder (a bot
+ * often scaffolds its project in a subfolder, e.g. `add-demo/`), with a peek
+ * into its test/src/lib/app folders so test and source files one level down
+ * are visible without an unbounded recursive walk.
+ */
+type ProjectDir = {
+  rel: string;
+  entries: DirEntry[];
+  peeked: Map<string, DirEntry[]>;
+};
+
+async function discoverProjectDirs(
+  sandbox: SandboxProvider,
+  workspace: RunWorkspace,
+): Promise<ProjectDir[]> {
+  const rootEntries = await listWorkspaceEntries(sandbox, workspace, "");
+  const dirs: ProjectDir[] = [{ rel: "", entries: rootEntries, peeked: new Map() }];
+  const subdirs = rootEntries
+    .filter((entry) => entry.kind === "dir" && !IGNORED_DIR_NAMES.has(entry.name))
+    .slice(0, MAX_PROJECT_SUBDIRS);
+  for (const sub of subdirs) {
+    dirs.push({
+      rel: sub.name,
+      entries: await listWorkspaceEntries(sandbox, workspace, sub.name),
+      peeked: new Map(),
+    });
+  }
+  for (const dir of dirs) {
+    for (const entry of dir.entries) {
+      if (entry.kind !== "dir" || !PEEK_DIR_NAMES.has(entry.name)) continue;
+      dir.peeked.set(
+        entry.name,
+        await listWorkspaceEntries(sandbox, workspace, joinRel(dir.rel, entry.name)),
+      );
+    }
+  }
+  return dirs;
+}
+
+function dirHasFile(dir: ProjectDir, name: string): boolean {
+  return dir.entries.some((entry) => entry.kind === "file" && entry.name === name);
+}
+
+function dirHasEslintConfig(dir: ProjectDir): boolean {
+  return dir.entries.some(
+    (entry) =>
+      entry.kind === "file" &&
+      (entry.name === ".eslintrc" ||
+        entry.name.startsWith(".eslintrc.") ||
+        entry.name === "eslint.config.js" ||
+        entry.name === "eslint.config.mjs" ||
+        entry.name === "eslint.config.ts"),
+  );
+}
+
+async function readProjectText(
+  sandbox: SandboxProvider,
+  workspace: RunWorkspace,
+  dir: ProjectDir,
+  name: string,
+): Promise<string | undefined> {
+  return readWorkspaceText(sandbox, workspace, joinRel(dir.rel, name));
+}
+
+async function readProjectPackageJson(
+  sandbox: SandboxProvider,
+  workspace: RunWorkspace,
+  dir: ProjectDir,
+): Promise<{ scripts?: Record<string, unknown> } | undefined> {
+  const text = await readProjectText(sandbox, workspace, dir, "package.json");
+  if (text === undefined) return undefined;
+  try {
+    return JSON.parse(text) as { scripts?: Record<string, unknown> };
+  } catch {
+    return undefined;
+  }
+}
+
+/** The cwd to run a command in: absent for the workspace root. */
+function projectCwd(dir: ProjectDir): { cwd?: string } {
+  return dir.rel ? { cwd: dir.rel } : {};
+}
+
+function dirHasNodeTestFiles(dir: ProjectDir): boolean {
+  const has = (entries: DirEntry[]) =>
+    entries.some((entry) => entry.kind === "file" && TEST_FILE_RE.test(entry.name));
+  if (has(dir.entries)) return true;
+  for (const entries of dir.peeked.values()) if (has(entries)) return true;
+  return false;
+}
+
+function dirHasPyTestFiles(dir: ProjectDir): boolean {
+  const has = (entries: DirEntry[]) =>
+    entries.some((entry) => entry.kind === "file" && PY_TEST_FILE_RE.test(entry.name));
+  if (has(dir.entries)) return true;
+  for (const entries of dir.peeked.values()) if (has(entries)) return true;
+  return false;
+}
+
+function dirHasPyFiles(dir: ProjectDir): boolean {
+  const has = (entries: DirEntry[]) =>
+    entries.some((entry) => entry.kind === "file" && entry.name.endsWith(".py"));
+  if (has(dir.entries)) return true;
+  for (const entries of dir.peeked.values()) if (has(entries)) return true;
+  return false;
+}
+
+/** Plain JS files in a project folder, relative to it (cwd-relative for --check). */
+function dirJsFiles(dir: ProjectDir): string[] {
+  const files: string[] = [];
+  const add = (entries: DirEntry[], prefix: string) => {
+    for (const entry of entries) {
+      if (files.length >= MAX_NODE_CHECK_FILES) return;
+      if (entry.kind === "file" && JS_FILE_RE.test(entry.name)) {
+        files.push(prefix ? `${prefix}/${entry.name}` : entry.name);
+      }
+    }
+  };
+  add(dir.entries, "");
+  for (const [name, entries] of dir.peeked) {
+    if (files.length >= MAX_NODE_CHECK_FILES) break;
+    add(entries, name);
+  }
+  return files;
 }
 
 /** Parse `git status --porcelain=v1 -b` output. */
@@ -208,39 +378,49 @@ export async function gitDiffFromTool(
   return parseGitDiffOutput(redactSecrets(result.stdout, workspace.runSecrets));
 }
 
-/** Detect the test runner for this workspace, preferring Node, then pytest, then Go. */
+/**
+ * Detect the test runner for this workspace, preferring Node, then pytest,
+ * then Go. Projects live in the workspace root or an immediate subfolder
+ * (e.g. a bot's `add-demo/`), so every candidate folder is probed in that
+ * order; the command runs in the folder that owns the runner.
+ */
 export async function detectTestRunner(
   sandbox: SandboxProvider,
   workspace: RunWorkspace,
-): Promise<{ argv: string[] } | { error: string }> {
-  const packageJson = await readWorkspaceText(sandbox, workspace, "package.json");
-  if (packageJson !== undefined) {
-    try {
-      const parsed: unknown = JSON.parse(packageJson);
-      const scripts = (parsed as { scripts?: Record<string, unknown> } | null)?.scripts;
-      if (scripts?.test) {
-        const lock = await readWorkspaceText(sandbox, workspace, "pnpm-lock.yaml");
-        return { argv: lock !== undefined ? ["pnpm", "test"] : ["npm", "test"] };
-      }
-    } catch {
-      // An unreadable package.json is not a test runner; keep probing.
+): Promise<DetectedCommand | { error: string }> {
+  const dirs = await discoverProjectDirs(sandbox, workspace);
+  for (const dir of dirs) {
+    const pkg = await readProjectPackageJson(sandbox, workspace, dir);
+    if (pkg?.scripts?.test) {
+      const lock = await readProjectText(sandbox, workspace, dir, "pnpm-lock.yaml");
+      return {
+        argv: lock !== undefined ? ["pnpm", "test"] : ["npm", "test"],
+        ...projectCwd(dir),
+      };
     }
   }
-  const pytestIni = await readWorkspaceText(sandbox, workspace, "pytest.ini");
-  const pyproject = await readWorkspaceText(sandbox, workspace, "pyproject.toml");
-  const names = await listWorkspaceRootNames(sandbox, workspace);
-  const hasTestFiles = names.some(
-    (name) => (name.startsWith("test_") && name.endsWith(".py")) || name.endsWith("_test.py"),
-  );
-  if (
-    pytestIni !== undefined ||
-    (pyproject !== undefined && /pytest/.test(pyproject)) ||
-    hasTestFiles
-  ) {
-    return { argv: ["python", "-m", "pytest", "-q"] };
+  for (const dir of dirs) {
+    const pytestIni = await readProjectText(sandbox, workspace, dir, "pytest.ini");
+    const pyproject = await readProjectText(sandbox, workspace, dir, "pyproject.toml");
+    if (
+      pytestIni !== undefined ||
+      (pyproject !== undefined && /pytest/.test(pyproject)) ||
+      dirHasPyTestFiles(dir)
+    ) {
+      return { argv: ["python", "-m", "pytest", "-q"], ...projectCwd(dir) };
+    }
   }
-  if ((await readWorkspaceText(sandbox, workspace, "go.mod")) !== undefined) {
-    return { argv: ["go", "test", "./..."] };
+  for (const dir of dirs) {
+    if (dirHasFile(dir, "go.mod")) {
+      return { argv: ["go", "test", "./..."], ...projectCwd(dir) };
+    }
+  }
+  // Plain Node project: test files but no package.json script — `node --test`
+  // (Node 18+) discovers them from the project folder.
+  for (const dir of dirs) {
+    if (dirHasNodeTestFiles(dir)) {
+      return { argv: ["node", "--test"], ...projectCwd(dir) };
+    }
   }
   return { error: "no test runner detected" };
 }
@@ -280,7 +460,7 @@ export async function runTestsFromTool(
 ) {
   const detected = await detectTestRunner(sandbox, workspace);
   if ("error" in detected) return detected;
-  const result = await runSandboxCommand(sandbox, workspace, detected.argv, undefined, 300_000);
+  const result = await runSandboxCommand(sandbox, workspace, detected.argv, detected.cwd, 300_000);
   return parseTestResults(
     redactSecrets(result.stdout, workspace.runSecrets),
     redactSecrets(result.stderr, workspace.runSecrets),
@@ -338,7 +518,28 @@ export function parseDiagnosticsOutput(
   if (diagnostics.length === 0) {
     // Cargo points at the failing span on the line after its `error:` header.
     let lastReport: { severity: string; message: string } | undefined;
+    // `node --check` prints the offending file and line, then a few lines
+    // later `SyntaxError: ...`; pair the two into one diagnostic.
+    let pendingNodeCheck: { path: string; line: number; age: number } | undefined;
     for (const line of combined.split("\n")) {
+      const syntaxError = line.match(/^SyntaxError:\s*(.+)$/);
+      if (syntaxError && pendingNodeCheck) {
+        diagnostics.push({
+          path: pendingNodeCheck.path,
+          line: pendingNodeCheck.line,
+          column: 0,
+          severity: "error",
+          message: syntaxError[1]!.trim(),
+        });
+        pendingNodeCheck = undefined;
+        continue;
+      }
+      if (pendingNodeCheck && ++pendingNodeCheck.age > 5) pendingNodeCheck = undefined;
+      const nodeCheck = line.match(/^(.+\.(?:js|mjs|cjs)):(\d+)$/);
+      if (nodeCheck) {
+        pendingNodeCheck = { path: nodeCheck[1]!, line: Number(nodeCheck[2]), age: 0 };
+        continue;
+      }
       const header = line.match(/^(error|warning)(?:\[[A-Z]+\d+\])?:\s*(.+)$/);
       if (header) {
         lastReport = { severity: header[1]!, message: header[2]!.trim() };
@@ -389,40 +590,36 @@ export function parseDiagnosticsOutput(
   };
 }
 
-/** Detect the static checker for this workspace, preferring Go vet, then ruff, tsc, eslint. */
+/**
+ * Detect the static checker for this workspace, preferring Go vet, then
+ * ruff, tsc, eslint — in the workspace root or an immediate subfolder.
+ */
 export async function detectChecker(
   sandbox: SandboxProvider,
   workspace: RunWorkspace,
-): Promise<{ argv: string[] } | { error: string }> {
-  if ((await readWorkspaceText(sandbox, workspace, "go.mod")) !== undefined) {
-    return { argv: ["go", "vet", "./..."] };
+): Promise<DetectedCommand | { error: string }> {
+  const dirs = await discoverProjectDirs(sandbox, workspace);
+  for (const dir of dirs) {
+    if (dirHasFile(dir, "go.mod")) {
+      return { argv: ["go", "vet", "./..."], ...projectCwd(dir) };
+    }
   }
-  const pyproject = await readWorkspaceText(sandbox, workspace, "pyproject.toml");
-  const ruffToml = await readWorkspaceText(sandbox, workspace, "ruff.toml");
-  const names = await listWorkspaceRootNames(sandbox, workspace);
-  if (
-    pyproject !== undefined ||
-    ruffToml !== undefined ||
-    names.some((name) => name.endsWith(".py"))
-  ) {
-    return { argv: ["ruff", "check", "."] };
+  for (const dir of dirs) {
+    const pyproject = await readProjectText(sandbox, workspace, dir, "pyproject.toml");
+    const ruffToml = await readProjectText(sandbox, workspace, dir, "ruff.toml");
+    if (pyproject !== undefined || ruffToml !== undefined || dirHasPyFiles(dir)) {
+      return { argv: ["ruff", "check", "."], ...projectCwd(dir) };
+    }
   }
-  const tsconfig = await readWorkspaceText(sandbox, workspace, "tsconfig.json");
-  const packageJson = await readWorkspaceText(sandbox, workspace, "package.json");
-  if (tsconfig !== undefined && packageJson !== undefined) {
-    return { argv: ["npx", "tsc", "--noEmit"] };
+  for (const dir of dirs) {
+    if (dirHasFile(dir, "tsconfig.json")) {
+      return { argv: ["npx", "tsc", "--noEmit"], ...projectCwd(dir) };
+    }
   }
-  if (
-    names.some(
-      (name) =>
-        name === ".eslintrc" ||
-        name.startsWith(".eslintrc.") ||
-        name === "eslint.config.js" ||
-        name === "eslint.config.mjs" ||
-        name === "eslint.config.ts",
-    )
-  ) {
-    return { argv: ["npx", "eslint", "--format", "json", "."] };
+  for (const dir of dirs) {
+    if (dirHasEslintConfig(dir)) {
+      return { argv: ["npx", "eslint", "--format", "json", "."], ...projectCwd(dir) };
+    }
   }
   return { error: "no checker configured" };
 }
@@ -433,42 +630,83 @@ export async function diagnosticsFromTool(
   _args: Record<string, unknown>,
 ) {
   const detected = await detectChecker(sandbox, workspace);
-  if ("error" in detected) return detected;
-  const result = await runSandboxCommand(sandbox, workspace, detected.argv, undefined, 300_000);
-  return parseDiagnosticsOutput(
-    redactSecrets(result.stdout, workspace.runSecrets),
-    redactSecrets(result.stderr, workspace.runSecrets),
-    result.code,
-  );
+  if (!("error" in detected)) {
+    const result = await runSandboxCommand(
+      sandbox,
+      workspace,
+      detected.argv,
+      detected.cwd,
+      300_000,
+    );
+    return parseDiagnosticsOutput(
+      redactSecrets(result.stdout, workspace.runSecrets),
+      redactSecrets(result.stderr, workspace.runSecrets),
+      result.code,
+    );
+  }
+  // Fallback: a plain JS project with no configured checker still gets a
+  // syntax check of its files, instead of "no checker configured".
+  const dirs = await discoverProjectDirs(sandbox, workspace);
+  for (const dir of dirs) {
+    const files = dirJsFiles(dir);
+    if (files.length === 0) continue;
+    let stdout = "";
+    let stderr = "";
+    let code = 0;
+    for (const file of files) {
+      const result = await runSandboxCommand(
+        sandbox,
+        workspace,
+        ["node", "--check", file],
+        dir.rel || undefined,
+        300_000,
+      );
+      stdout += result.stdout;
+      stderr += result.stderr;
+      if (result.code !== 0) code = result.code;
+    }
+    return parseDiagnosticsOutput(
+      redactSecrets(stdout, workspace.runSecrets),
+      redactSecrets(stderr, workspace.runSecrets),
+      code,
+    );
+  }
+  return detected;
 }
 
-/** Detect the build step for this workspace: package.json script, tsc, go, cargo. */
+/**
+ * Detect the build step for this workspace: package.json script, tsc, go,
+ * cargo — in the workspace root or an immediate subfolder.
+ */
 export async function detectBuild(
   sandbox: SandboxProvider,
   workspace: RunWorkspace,
-): Promise<{ argv: string[] } | { error: string }> {
-  const packageJson = await readWorkspaceText(sandbox, workspace, "package.json");
-  if (packageJson !== undefined) {
-    try {
-      const parsed: unknown = JSON.parse(packageJson);
-      const scripts = (parsed as { scripts?: Record<string, unknown> } | null)?.scripts;
-      if (scripts?.build) {
-        const lock = await readWorkspaceText(sandbox, workspace, "pnpm-lock.yaml");
-        return { argv: lock !== undefined ? ["pnpm", "build"] : ["npm", "run", "build"] };
-      }
-    } catch {
-      // An unreadable package.json is not a build; keep probing.
+): Promise<DetectedCommand | { error: string }> {
+  const dirs = await discoverProjectDirs(sandbox, workspace);
+  for (const dir of dirs) {
+    const pkg = await readProjectPackageJson(sandbox, workspace, dir);
+    if (pkg?.scripts?.build) {
+      const lock = await readProjectText(sandbox, workspace, dir, "pnpm-lock.yaml");
+      return {
+        argv: lock !== undefined ? ["pnpm", "build"] : ["npm", "run", "build"],
+        ...projectCwd(dir),
+      };
     }
   }
-  const tsconfig = await readWorkspaceText(sandbox, workspace, "tsconfig.json");
-  if (tsconfig !== undefined && packageJson !== undefined) {
-    return { argv: ["npx", "tsc", "--noEmit"] };
+  for (const dir of dirs) {
+    if (dirHasFile(dir, "tsconfig.json")) {
+      return { argv: ["npx", "tsc", "--noEmit"], ...projectCwd(dir) };
+    }
   }
-  if ((await readWorkspaceText(sandbox, workspace, "go.mod")) !== undefined) {
-    return { argv: ["go", "build", "./..."] };
+  for (const dir of dirs) {
+    if (dirHasFile(dir, "go.mod")) {
+      return { argv: ["go", "build", "./..."], ...projectCwd(dir) };
+    }
   }
-  if ((await readWorkspaceText(sandbox, workspace, "Cargo.toml")) !== undefined) {
-    return { argv: ["cargo", "build"] };
+  for (const dir of dirs) {
+    if (dirHasFile(dir, "Cargo.toml")) {
+      return { argv: ["cargo", "build"], ...projectCwd(dir) };
+    }
   }
   return { error: "no build configured" };
 }
@@ -500,7 +738,7 @@ export async function runBuildFromTool(
 ) {
   const detected = await detectBuild(sandbox, workspace);
   if ("error" in detected) return detected;
-  const result = await runSandboxCommand(sandbox, workspace, detected.argv, undefined, 300_000);
+  const result = await runSandboxCommand(sandbox, workspace, detected.argv, detected.cwd, 300_000);
   return parseBuildOutput(
     redactSecrets(result.stdout, workspace.runSecrets),
     redactSecrets(result.stderr, workspace.runSecrets),
